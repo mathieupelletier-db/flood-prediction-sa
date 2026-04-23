@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { PickingInfo } from "@deck.gl/core";
 import { FloodMap, THEMES, type ViewState, type MapTheme } from "./FloodMap";
-import { api, type AOI, type PredictionCell, type FloodEvent, type Metrics } from "./api";
+import { AddressCard } from "./AddressCard";
+import { api, type AOI, type AddressLookup, type PredictionCell, type FloodEvent, type Metrics } from "./api";
 
 const DEFAULT_VIEW: ViewState = {
   longitude: -73.65,
@@ -40,6 +41,14 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [view, setView] = useState<ViewState>(DEFAULT_VIEW);
   const [hover, setHover] = useState<PickingInfo | null>(null);
+  const [addressHit, setAddressHit] = useState<AddressLookup | null>(null);
+
+  const onAddressResult = useCallback((hit: AddressLookup | null) => {
+    setAddressHit(hit);
+    if (hit) {
+      setView({ longitude: hit.lon, latitude: hit.lat, zoom: 14, pitch: 30, bearing: 0 });
+    }
+  }, []);
 
   useEffect(() => {
     api.listAoi()
@@ -120,6 +129,12 @@ export default function App() {
         {d.max24h_precip_mm !== null && (
           <div>Historic max 24h: {Math.round(d.max24h_precip_mm)} mm</div>
         )}
+        {d.building_count != null && d.building_count > 0 && (
+          <div>Buildings: <b>{d.building_count.toLocaleString()}</b></div>
+        )}
+        {d.expected_buildings_at_risk != null && d.expected_buildings_at_risk > 0.5 && (
+          <div>Expected at risk: <b>{d.expected_buildings_at_risk.toFixed(1)}</b></div>
+        )}
         <div>Historical flood: {d.label_real ? "yes" : "no"}</div>
       </div>
     );
@@ -141,6 +156,7 @@ export default function App() {
           events={events}
           showRealFloods={showFloods}
           theme={theme}
+          pin={addressHit ? { lat: addressHit.lat, lon: addressHit.lon, prob: addressHit.flood_prob } : null}
           onHover={onHover}
         />
       </div>
@@ -148,6 +164,13 @@ export default function App() {
       <aside className="panel">
         <h1>Montreal Flood Risk</h1>
         <p className="subtitle">GeoBrix + Spatial SQL + Spark ML</p>
+
+        <AddressCard
+          aoi={aoi}
+          scenarioMm={snappedScenario}
+          onResult={onAddressResult}
+          result={addressHit}
+        />
 
         <div className="row">
           <label htmlFor="aoi">AOI</label>
@@ -245,6 +268,25 @@ export default function App() {
                   <span className="v">{(metrics.recall_vs_real * 100).toFixed(1)}%</span>
                 </div>
               )}
+              <div className="kpi kpi-section">Exposure</div>
+              <div className="kpi">
+                <span>Expected buildings at risk</span>
+                <span className="v">
+                  {Math.round(metrics.expected_buildings_at_risk).toLocaleString()}
+                </span>
+              </div>
+              <div className="kpi">
+                <span>of which residential</span>
+                <span className="v">
+                  {Math.round(metrics.expected_residential_at_risk).toLocaleString()}
+                </span>
+              </div>
+              <div className="kpi">
+                <span>High-risk cells with buildings</span>
+                <span className="v">
+                  {metrics.high_risk_cells_with_buildings.toLocaleString()}
+                </span>
+              </div>
             </>
           )}
         </div>

@@ -117,6 +117,7 @@ publish = (scored
   .select("aoi_name", "h3", "scenario_24h_mm", "avg_elev", "min_elev",
           "slope_deg", "dist_to_water_m", "twi",
           "annual_precip_mm", "max24h_precip_mm", "max5d_precip_mm",
+          "building_count", "residential_count",
           "flood_prob",
           F.coalesce(F.col("label_real"), F.lit(0)).cast("int").alias("label_real"))
   .withColumn("scenario_24h_mm", F.col("scenario_24h_mm").cast("int")))
@@ -128,6 +129,9 @@ final = spark.sql("""
          h3_boundaryasgeojson(h3) AS geometry_geojson,
          avg_elev, min_elev, slope_deg, dist_to_water_m, twi,
          annual_precip_mm, max24h_precip_mm, max5d_precip_mm,
+         building_count, residential_count,
+         CAST(flood_prob * building_count    AS DOUBLE) AS expected_buildings_at_risk,
+         CAST(flood_prob * residential_count AS DOUBLE) AS expected_residential_at_risk,
          flood_prob, label_real
   FROM v_scored
 """)

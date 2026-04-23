@@ -188,6 +188,62 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 2b. OSM buildings (for exposure computation)
+# MAGIC
+# MAGIC We pull every `building=*` footprint in the AOI via Overpass and store the
+# MAGIC centroid + residential flag. Silver tessellates these to H3 to give each
+# MAGIC cell a `building_count`, which downstream lets us compute
+# MAGIC `expected_buildings_at_risk = flood_prob * building_count` per prediction.
+
+# COMMAND ----------
+
+buildings_path = f"{volume_root}/buildings/{aoi_name}_buildings.geojson"
+if not os.path.exists(buildings_path):
+    os.makedirs(os.path.dirname(buildings_path), exist_ok=True)
+    bbox = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+    # `out center tags` gives us the centroid + tag dict without shipping every
+    # polygon vertex - at Montreal AOI scale this is ~300k rows vs ~30 MB, fine.
+    query = f"""
+    [out:json][timeout:180];
+    (
+      way["building"]({bbox});
+      relation["building"]({bbox});
+    );
+    out center tags;
+    """
+    raw = fetch_overpass(query)
+
+    RESIDENTIAL_VALUES = {
+        "yes", "residential", "house", "apartments", "detached",
+        "semidetached_house", "terrace", "bungalow", "dormitory",
+    }
+    features = []
+    for el in raw.get("elements", []):
+        tags = el.get("tags", {}) or {}
+        btype = tags.get("building", "yes")
+        c = el.get("center") or {}
+        lon, lat = c.get("lon"), c.get("lat")
+        if lon is None or lat is None:
+            continue
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "osm_id": f"{el['type']}/{el['id']}",
+                "building": btype,
+                "residential": 1 if btype in RESIDENTIAL_VALUES else 0,
+            },
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+        })
+    fc = {"type": "FeatureCollection", "features": features}
+    with open(buildings_path, "w") as f:
+        json.dump(fc, f)
+    print(f"Wrote {len(features)} building centroids -> {buildings_path}")
+else:
+    print("Buildings already cached ->", buildings_path)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 3. Historical flood polygons (Quebec 2017 / 2019 ZIS)
 # MAGIC
 # MAGIC Pulled from the authoritative Ministère de l'Environnement ArcGIS
@@ -354,6 +410,34 @@ flood_df = spark.createDataFrame(
          .option("overwriteSchema", "true")
          .saveAsTable(f"{bronze_ns}.bronze_flood_events"))
 
+# Buildings -> bronze (point centroid + residential flag + OSM-derived tags)
+with open(buildings_path) as f:
+    bld_fc = json.load(f)
+bld_rows = [
+    (aoi_name,
+     feat["properties"].get("osm_id", ""),
+     feat["properties"].get("building", ""),
+     int(feat["properties"].get("residential", 0) or 0),
+     float(feat["geometry"]["coordinates"][0]),
+     float(feat["geometry"]["coordinates"][1]))
+    for feat in bld_fc["features"]
+]
+from pyspark.sql.types import IntegerType
+bld_schema = StructType([
+    StructField("aoi_name",     StringType(),  False),
+    StructField("osm_id",       StringType(),  True),
+    StructField("building",     StringType(),  True),
+    StructField("residential",  IntegerType(), False),
+    StructField("lon",          DoubleType(),  False),
+    StructField("lat",          DoubleType(),  False),
+])
+bld_df = spark.createDataFrame(bld_rows, schema=bld_schema) \
+    if bld_rows else spark.createDataFrame([], schema=bld_schema)
+(bld_df.withColumn("ingested_at", F.current_timestamp())
+       .write.mode("overwrite")
+       .option("overwriteSchema", "true")
+       .saveAsTable(f"{bronze_ns}.bronze_buildings"))
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -484,7 +568,8 @@ precip_df = spark.createDataFrame(
           .saveAsTable(f"{bronze_ns}.bronze_precip_grid"))
 
 print("Bronze tables written:")
-for t in ("bronze_dem_manifest", "bronze_hydrography", "bronze_flood_events", "bronze_precip_grid"):
+for t in ("bronze_dem_manifest", "bronze_hydrography", "bronze_flood_events",
+          "bronze_precip_grid", "bronze_buildings"):
     n = spark.table(f"{bronze_ns}.{t}").count()
     print(f"  {bronze_ns}.{t}: {n} rows")
 
@@ -496,4 +581,5 @@ dbutils.notebook.exit(json.dumps({
     "hydro_path": hydro_path,
     "flood_path": flood_path,
     "precip_cache": precip_cache,
+    "buildings_path": buildings_path,
 }))

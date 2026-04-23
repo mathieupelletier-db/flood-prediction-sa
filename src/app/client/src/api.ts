@@ -11,6 +11,9 @@ export type PredictionCell = {
   dist_to_water_m: number | null;
   annual_precip_mm: number | null;
   max24h_precip_mm: number | null;
+  building_count: number | null;
+  residential_count: number | null;
+  expected_buildings_at_risk: number | null;
   label_real: number;
   geometry: GeoJSON.Polygon | Record<string, unknown>;
 };
@@ -37,6 +40,28 @@ export type Metrics = {
   real_flood_cells: number;
   precision_vs_real: number | null;
   recall_vs_real: number | null;
+  expected_buildings_at_risk: number;
+  expected_residential_at_risk: number;
+  high_risk_cells_with_buildings: number;
+};
+
+export type AddressLookup = {
+  query: string;
+  resolved_name: string;
+  lat: number;
+  lon: number;
+  h3: string;
+  scenario_24h_mm: number;
+  flood_prob: number;
+  min_elev: number | null;
+  slope_deg: number | null;
+  dist_to_water_m: number | null;
+  annual_precip_mm: number | null;
+  max24h_precip_mm: number | null;
+  building_count: number | null;
+  residential_count: number | null;
+  expected_buildings_at_risk: number | null;
+  sweep: [number, number][];
 };
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -59,5 +84,10 @@ export const api = {
   metrics: (aoi: string, scenarioMm: number, threshold: number) =>
     fetchJson<Metrics>(
       `/api/metrics?aoi=${encodeURIComponent(aoi)}&scenario_mm=${scenarioMm}&threshold=${threshold}`,
+    ),
+  lookup: (aoi: string, scenarioMm: number, query: string) =>
+    fetchJson<AddressLookup>(
+      `/api/lookup?aoi=${encodeURIComponent(aoi)}&scenario_mm=${scenarioMm}` +
+        `&q=${encodeURIComponent(query)}`,
     ),
 };

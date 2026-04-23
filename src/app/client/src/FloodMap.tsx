@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import DeckGL from "@deck.gl/react";
 import { H3HexagonLayer } from "@deck.gl/geo-layers";
-import { GeoJsonLayer } from "@deck.gl/layers";
+import { GeoJsonLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { Map as MapLibre } from "react-map-gl/maplibre";
 import type { PickingInfo } from "@deck.gl/core";
 import type { PredictionCell, FloodEvent } from "./api";
@@ -30,6 +30,7 @@ type Props = {
   events: FloodEvent[];
   showRealFloods: boolean;
   theme: MapTheme;
+  pin?: { lat: number; lon: number; prob: number } | null;
   onHover?: (info: PickingInfo) => void;
 };
 
@@ -40,6 +41,7 @@ export function FloodMap({
   events,
   showRealFloods,
   theme,
+  pin,
   onHover,
 }: Props) {
   const hexLayer = useMemo(
@@ -104,11 +106,29 @@ export function FloodMap({
     );
   }, [events, showRealFloods]);
 
+  const pinLayer = useMemo(() => {
+    if (!pin) return null;
+    const [r, g, b] = viridis(pin.prob);
+    return new ScatterplotLayer<{ position: [number, number]; color: [number, number, number] }>({
+      id: "addr-pin",
+      data: [{ position: [pin.lon, pin.lat], color: [r, g, b] }],
+      pickable: false,
+      stroked: true,
+      filled: true,
+      lineWidthMinPixels: 2,
+      radiusUnits: "pixels",
+      getPosition: (d) => d.position,
+      getRadius: 10,
+      getFillColor: (d) => [...d.color, 230] as [number, number, number, number],
+      getLineColor: [230, 230, 230, 255],
+    });
+  }, [pin]);
+
   return (
     <DeckGL
       viewState={viewState}
       controller
-      layers={[hexLayer, ...floodLayers]}
+      layers={[hexLayer, ...floodLayers, ...(pinLayer ? [pinLayer] : [])]}
       onViewStateChange={(e) => onViewStateChange(e.viewState as ViewState)}
       onHover={onHover}
     >

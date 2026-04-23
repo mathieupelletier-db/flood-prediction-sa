@@ -14,9 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
+import h3
+import requests
 from databricks import sql as dbsql
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -97,6 +101,9 @@ class PredictionCell(BaseModel):
     dist_to_water_m: float | None = None
     annual_precip_mm: float | None = None
     max24h_precip_mm: float | None = None
+    building_count: int | None = None
+    residential_count: int | None = None
+    expected_buildings_at_risk: float | None = None
     label_real: int = 0
     geometry: dict[str, Any] = Field(description="GeoJSON Polygon for the H3 cell")
 
@@ -134,6 +141,31 @@ class Metrics(BaseModel):
     real_flood_cells: int
     precision_vs_real: float | None = None
     recall_vs_real: float | None = None
+    expected_buildings_at_risk: float = 0.0
+    expected_residential_at_risk: float = 0.0
+    high_risk_cells_with_buildings: int = 0
+
+
+class AddressLookup(BaseModel):
+    query: str
+    resolved_name: str
+    lat: float
+    lon: float
+    h3: str
+    scenario_24h_mm: int
+    flood_prob: float
+    min_elev: float | None = None
+    slope_deg: float | None = None
+    dist_to_water_m: float | None = None
+    annual_precip_mm: float | None = None
+    max24h_precip_mm: float | None = None
+    building_count: int | None = None
+    residential_count: int | None = None
+    expected_buildings_at_risk: float | None = None
+    sweep: list[tuple[int, float]] = Field(
+        default_factory=list,
+        description="[(scenario_24h_mm, flood_prob), ...] across all available scenarios",
+    )
 
 
 # App --------------------------------------------------------------------------
@@ -211,6 +243,7 @@ def predictions(
     q = f"""
         SELECT h3, flood_prob, min_elev, slope_deg, dist_to_water_m,
                annual_precip_mm, max24h_precip_mm,
+               building_count, residential_count, expected_buildings_at_risk,
                label_real, geometry_geojson
         FROM {NS}.gold_h3_flood_predictions
         WHERE {where_sql}
@@ -227,6 +260,12 @@ def predictions(
             dist_to_water_m=float(r["dist_to_water_m"]) if r["dist_to_water_m"] is not None else None,
             annual_precip_mm=float(r["annual_precip_mm"]) if r["annual_precip_mm"] is not None else None,
             max24h_precip_mm=float(r["max24h_precip_mm"]) if r["max24h_precip_mm"] is not None else None,
+            building_count=int(r["building_count"]) if r.get("building_count") is not None else None,
+            residential_count=int(r["residential_count"]) if r.get("residential_count") is not None else None,
+            expected_buildings_at_risk=(
+                float(r["expected_buildings_at_risk"])
+                if r.get("expected_buildings_at_risk") is not None else None
+            ),
             label_real=int(r["label_real"] or 0),
             geometry=json.loads(r["geometry_geojson"]) if r["geometry_geojson"] else {},
         )
@@ -268,11 +307,15 @@ def metrics(
                SUM(label_real)                                                  AS real_pos,
                SUM(CASE WHEN flood_prob >= ? AND label_real = 1 THEN 1 ELSE 0 END) AS tp,
                SUM(CASE WHEN flood_prob >= ? AND label_real = 0 THEN 1 ELSE 0 END) AS fp,
-               SUM(CASE WHEN flood_prob <  ? AND label_real = 1 THEN 1 ELSE 0 END) AS fn
+               SUM(CASE WHEN flood_prob <  ? AND label_real = 1 THEN 1 ELSE 0 END) AS fn,
+               SUM(expected_buildings_at_risk)                                    AS exp_bld,
+               SUM(flood_prob * COALESCE(residential_count, 0))                   AS exp_res,
+               SUM(CASE WHEN flood_prob >= ? AND COALESCE(building_count,0) > 0
+                        THEN 1 ELSE 0 END)                                        AS hi_bld_cells
         FROM {NS}.gold_h3_flood_predictions
         WHERE aoi_name = ? AND scenario_24h_mm = ?
         """,
-        (threshold, threshold, threshold, threshold, aoi, scenario),
+        (threshold, threshold, threshold, threshold, threshold, aoi, scenario),
     )[0]
     tp, fp, fn = (int(row[k] or 0) for k in ("tp", "fp", "fn"))
     precision = tp / (tp + fp) if (tp + fp) else None
@@ -286,6 +329,135 @@ def metrics(
         real_flood_cells=int(row["real_pos"] or 0),
         precision_vs_real=precision,
         recall_vs_real=recall,
+        expected_buildings_at_risk=float(row["exp_bld"] or 0.0),
+        expected_residential_at_risk=float(row["exp_res"] or 0.0),
+        high_risk_cells_with_buildings=int(row["hi_bld_cells"] or 0),
+    )
+
+
+# Address lookup --------------------------------------------------------------
+
+NOMINATIM_URL = os.environ.get("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
+NOMINATIM_USER_AGENT = os.environ.get(
+    "NOMINATIM_USER_AGENT",
+    "flood-prediction-demo/0.1 (github.com/mathieupelletier-db/flood-prediction-sa)",
+)
+
+
+@lru_cache(maxsize=512)
+def _geocode(query: str, bbox: tuple[float, float, float, float] | None) -> dict[str, Any] | None:
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "limit": 1,
+        "addressdetails": 0,
+    }
+    if bbox is not None:
+        # Nominatim `viewbox` is minlon,maxlat,maxlon,minlat (top-left + bottom-right)
+        params["viewbox"] = f"{bbox[0]},{bbox[3]},{bbox[2]},{bbox[1]}"
+        params["bounded"] = 1
+    r = requests.get(
+        NOMINATIM_URL, params=params,
+        headers={"User-Agent": NOMINATIM_USER_AGENT, "Accept-Language": "en,fr"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    hits = r.json() or []
+    return hits[0] if hits else None
+
+
+def _aoi_bbox(aoi: str) -> tuple[float, float, float, float] | None:
+    rows = _fetch(
+        f"SELECT min_lon, min_lat, max_lon, max_lat FROM {NS}.gold_aoi WHERE aoi_name = ?",
+        (aoi,),
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    return (float(r["min_lon"]), float(r["min_lat"]),
+            float(r["max_lon"]), float(r["max_lat"]))
+
+
+@app.get("/api/lookup", response_model=AddressLookup)
+def lookup(
+    q: str = Query(..., min_length=3, description="Address or place name to search"),
+    aoi: str = Query(default=DEFAULT_AOI),
+    scenario_mm: int = Query(default=100, ge=0, le=500),
+) -> AddressLookup:
+    bbox = _aoi_bbox(aoi)
+    hit = _geocode(q, bbox)
+    if hit is None:
+        # Retry once without the bbox constraint so out-of-AOI addresses still
+        # resolve (the map won't show a prediction for them, but the caller
+        # can display a "not in AOI" message).
+        hit = _geocode(q, None)
+    if hit is None:
+        raise HTTPException(status_code=404, detail=f"No geocoding result for '{q}'")
+
+    lat, lon = float(hit["lat"]), float(hit["lon"])
+    cell_str = h3.latlng_to_cell(lat, lon, 9)
+    # h3-py v4 returns the canonical hex string already.
+    cell_str = cell_str if isinstance(cell_str, str) else f"{int(cell_str):x}"
+    cell_int = int(cell_str, 16)
+
+    scenario = _nearest_scenario(aoi, scenario_mm)
+    cur = _fetch(
+        f"""
+        SELECT flood_prob, min_elev, slope_deg, dist_to_water_m,
+               annual_precip_mm, max24h_precip_mm,
+               building_count, residential_count, expected_buildings_at_risk
+        FROM {NS}.gold_h3_flood_predictions
+        WHERE aoi_name = ? AND h3 = ? AND scenario_24h_mm = ?
+        """,
+        (aoi, cell_int, scenario),
+    )
+    cur_row = cur[0] if cur else {}
+
+    sweep_rows = _fetch(
+        f"""
+        SELECT scenario_24h_mm, flood_prob
+        FROM {NS}.gold_h3_flood_predictions
+        WHERE aoi_name = ? AND h3 = ?
+        ORDER BY scenario_24h_mm
+        """,
+        (aoi, cell_int),
+    )
+    sweep = [(int(r["scenario_24h_mm"]), float(r["flood_prob"])) for r in sweep_rows]
+
+    return AddressLookup(
+        query=q,
+        resolved_name=str(hit.get("display_name") or q),
+        lat=lat, lon=lon,
+        h3=cell_str,
+        scenario_24h_mm=scenario,
+        flood_prob=float(cur_row.get("flood_prob") or 0.0),
+        min_elev=float(cur_row["min_elev"]) if cur_row.get("min_elev") is not None else None,
+        slope_deg=float(cur_row["slope_deg"]) if cur_row.get("slope_deg") is not None else None,
+        dist_to_water_m=(
+            float(cur_row["dist_to_water_m"])
+            if cur_row.get("dist_to_water_m") is not None else None
+        ),
+        annual_precip_mm=(
+            float(cur_row["annual_precip_mm"])
+            if cur_row.get("annual_precip_mm") is not None else None
+        ),
+        max24h_precip_mm=(
+            float(cur_row["max24h_precip_mm"])
+            if cur_row.get("max24h_precip_mm") is not None else None
+        ),
+        building_count=(
+            int(cur_row["building_count"])
+            if cur_row.get("building_count") is not None else None
+        ),
+        residential_count=(
+            int(cur_row["residential_count"])
+            if cur_row.get("residential_count") is not None else None
+        ),
+        expected_buildings_at_risk=(
+            float(cur_row["expected_buildings_at_risk"])
+            if cur_row.get("expected_buildings_at_risk") is not None else None
+        ),
+        sweep=sweep,
     )
 
 

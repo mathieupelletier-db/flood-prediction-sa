@@ -49,11 +49,16 @@ spark.sql(f"""
            COALESCE(d.dist_to_water_m, 1e6)    AS dist_to_water_m,
            COALESCE(p.annual_precip_mm, 0.0)   AS annual_precip_mm,
            COALESCE(p.max24h_precip_mm, 0.0)   AS max24h_precip_mm,
-           COALESCE(p.max5d_precip_mm,  0.0)   AS max5d_precip_mm
+           COALESCE(p.max5d_precip_mm,  0.0)   AS max5d_precip_mm,
+           -- Exposure columns: carried as metadata, NOT used as model features
+           -- so we don't leak location into the terrain model.
+           COALESCE(b.building_count, 0)        AS building_count,
+           COALESCE(b.residential_count, 0)     AS residential_count
     FROM {ns}.silver_h3_elev e
     LEFT JOIN {ns}.silver_h3_slope      s USING (aoi_name, h3)
     LEFT JOIN {ns}.silver_h3_dist_water d USING (aoi_name, h3)
     LEFT JOIN {ns}.silver_h3_precip     p USING (aoi_name, h3)
+    LEFT JOIN {ns}.silver_h3_buildings  b USING (aoi_name, h3)
     WHERE e.aoi_name = '{aoi_name}'
   )
   SELECT *,

@@ -328,6 +328,43 @@ print("silver_h3_precip:", spark.table(f"{ns}.silver_h3_precip").count())
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 5b. Buildings per H3 cell (exposure layer)
+# MAGIC
+# MAGIC Convert every OSM building centroid into an H3 cell at the feature
+# MAGIC resolution and aggregate. We also track a residential subcount, which
+# MAGIC is the subset of building tags most clearly tied to people-at-risk.
+
+# COMMAND ----------
+
+from pyspark.sql.types import IntegerType
+
+bld_pts = (spark.table(f"{ns}.bronze_buildings")
+                .where(F.col("aoi_name") == aoi_name)
+                .select("lat", "lon", "residential").collect())
+print(f"Tessellating {len(bld_pts):,} building centroids to H3 res {h3_res}")
+
+bld_acc: dict[int, tuple[int, int]] = {}   # cell -> (count_all, count_residential)
+for r in bld_pts:
+    cell_str = h3.latlng_to_cell(float(r["lat"]), float(r["lon"]), h3_res)
+    cid = int(cell_str, 16) if isinstance(cell_str, str) else int(cell_str)
+    a, b = bld_acc.get(cid, (0, 0))
+    bld_acc[cid] = (a + 1, b + (1 if int(r["residential"] or 0) else 0))
+
+bld_rows = [(aoi_name, int(cid), int(a), int(b)) for cid, (a, b) in bld_acc.items()]
+bld_schema = StructType([
+    StructField("aoi_name",          StringType(),  False),
+    StructField("h3",                LongType(),    False),
+    StructField("building_count",    IntegerType(), False),
+    StructField("residential_count", IntegerType(), False),
+])
+(spark.createDataFrame(bld_rows, bld_schema)
+      .write.mode("overwrite").option("overwriteSchema", "true")
+      .saveAsTable(f"{ns}.silver_h3_buildings"))
+print("silver_h3_buildings:", spark.table(f"{ns}.silver_h3_buildings").count())
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 6. Exclude cells that are actually waterways
 # MAGIC
 # MAGIC Cells whose centroid sits on top of a water polygon/line have
@@ -350,7 +387,8 @@ print(f"Dropping {n_dropped} in-water cells (dist_to_water_m < {WATER_DIST_THRES
 
 water_cells_df.createOrReplaceTempView("_water_cells_to_drop")
 for tbl in ("silver_h3_elev", "silver_h3_slope",
-            "silver_h3_precip", "silver_h3_dist_water"):
+            "silver_h3_precip", "silver_h3_dist_water",
+            "silver_h3_buildings"):
     spark.sql(f"""
       MERGE INTO {ns}.{tbl} t
       USING _water_cells_to_drop s
@@ -363,11 +401,14 @@ for tbl in ("silver_h3_elev", "silver_h3_slope",
 
 display(spark.sql(f"""
   SELECT e.h3, e.avg_elev, e.min_elev, s.avg_slope_deg,
-         d.dist_to_water_m, p.annual_precip_mm, p.max24h_precip_mm
+         d.dist_to_water_m, p.annual_precip_mm, p.max24h_precip_mm,
+         COALESCE(b.building_count, 0)    AS building_count,
+         COALESCE(b.residential_count, 0) AS residential_count
   FROM {ns}.silver_h3_elev e
   LEFT JOIN {ns}.silver_h3_slope      s USING (aoi_name, h3)
   LEFT JOIN {ns}.silver_h3_dist_water d USING (aoi_name, h3)
   LEFT JOIN {ns}.silver_h3_precip     p USING (aoi_name, h3)
-  ORDER BY e.min_elev ASC
+  LEFT JOIN {ns}.silver_h3_buildings  b USING (aoi_name, h3)
+  ORDER BY b.building_count DESC NULLS LAST
   LIMIT 20
 """))
