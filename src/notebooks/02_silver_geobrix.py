@@ -327,6 +327,40 @@ print("silver_h3_precip:", spark.table(f"{ns}.silver_h3_precip").count())
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## 6. Exclude cells that are actually waterways
+# MAGIC
+# MAGIC Cells whose centroid sits on top of a water polygon/line have
+# MAGIC `dist_to_water_m = 0` (shapely returns 0 for points inside/on the geom).
+# MAGIC These cells are river/lake surfaces, not flood-prone land, so we drop
+# MAGIC them from every silver table. `< 5 m` is a conservative threshold
+# MAGIC that handles both OSM geometry slop and H3 cell-centre quantization.
+
+# COMMAND ----------
+
+WATER_DIST_THRESHOLD_M = 5.0
+
+water_cells_sql = f"""
+  SELECT h3 FROM {ns}.silver_h3_dist_water
+  WHERE aoi_name = '{aoi_name}' AND dist_to_water_m < {WATER_DIST_THRESHOLD_M}
+"""
+water_cells_df = spark.sql(water_cells_sql)
+n_dropped = water_cells_df.count()
+print(f"Dropping {n_dropped} in-water cells (dist_to_water_m < {WATER_DIST_THRESHOLD_M} m)")
+
+water_cells_df.createOrReplaceTempView("_water_cells_to_drop")
+for tbl in ("silver_h3_elev", "silver_h3_slope",
+            "silver_h3_precip", "silver_h3_dist_water"):
+    spark.sql(f"""
+      MERGE INTO {ns}.{tbl} t
+      USING _water_cells_to_drop s
+      ON t.h3 = s.h3 AND t.aoi_name = '{aoi_name}'
+      WHEN MATCHED THEN DELETE
+    """)
+    print(f"  {tbl}: {spark.table(f'{ns}.{tbl}').count()} rows")
+
+# COMMAND ----------
+
 display(spark.sql(f"""
   SELECT e.h3, e.avg_elev, e.min_elev, s.avg_slope_deg,
          d.dist_to_water_m, p.annual_precip_mm, p.max24h_precip_mm
