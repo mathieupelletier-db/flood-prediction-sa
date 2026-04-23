@@ -1,0 +1,21 @@
+resources:
+  schemas:
+    flood_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: "Flood prediction demo - bronze/silver/gold tables for ${var.aoi_name}"
+
+  volumes:
+    flood_raw:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.flood_schema.name}
+      name: ${var.volume}
+      volume_type: MANAGED
+      comment: "Raw DEM tiles + hydrography + flood polygons + precip climatology"
+
+  registered_models:
+    flood_rf:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.flood_schema.name}
+      name: "flood_rf"
+      comment: "Random Forest classifier for H3 flood probability"

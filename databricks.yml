@@ -1,0 +1,68 @@
+bundle:
+  name: flood-prediction-sa
+
+include:
+  - resources/*.yml
+
+sync:
+  include:
+    - "src/app/client/dist/**"
+  exclude:
+    - "src/app/client/node_modules/**"
+    - "src/app/client/src/**"
+    - "src/app/client/*.json"
+    - "src/app/client/*.ts"
+    - "src/app/client/*.html"
+    - "src/app/client/tsconfig.tsbuildinfo"
+
+variables:
+  catalog:
+    description: "Unity Catalog catalog hosting the demo"
+    default: "flood_demo"
+  schema:
+    description: "UC schema used for all tables + volume"
+    default: "montreal"
+  volume:
+    description: "UC Volume that stores raw downloaded rasters/shapes"
+    default: "raw"
+
+  aoi_name:
+    description: "Short slug for the area of interest (used as subfolder + partition key)"
+    default: "greater_montreal"
+  aoi_bbox_wkt:
+    description: "AOI polygon as WKT in EPSG:4326, used to clip rasters and vectors"
+    default: "POLYGON((-74.05 45.30, -73.30 45.30, -73.30 45.80, -74.05 45.80, -74.05 45.30))"
+  aoi_bbox_min_lon: { default: "-74.05" }
+  aoi_bbox_min_lat: { default: "45.30" }
+  aoi_bbox_max_lon: { default: "-73.30" }
+  aoi_bbox_max_lat: { default: "45.80" }
+
+  h3_resolution:
+    description: "H3 resolution used for feature grid (9 ~ 174 m edge)"
+    default: "9"
+
+  scenarios_24h_mm:
+    description: "Comma-separated list of 24h rainfall scenarios (mm) to pre-score. Each becomes a partition in gold_h3_flood_predictions and a tick on the app's rainfall slider."
+    default: "10,30,60,100,150,200"
+
+  warehouse_id:
+    description: "Serverless SQL warehouse the app queries"
+    default: ""
+
+  model_name:
+    description: "3-part UC model name"
+    default: "flood_demo.montreal.flood_rf"
+
+targets:
+  dev:
+    default: true
+    mode: development
+    variables:
+      catalog: "catalog_j4zl8j_om2ldn"
+      schema: "montreal_dev"
+
+  prod:
+    mode: production
+    variables:
+      catalog: "catalog_j4zl8j_om2ldn"
+      schema: "montreal"

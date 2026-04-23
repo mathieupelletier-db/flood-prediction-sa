@@ -1,0 +1,24 @@
+command:
+  - "uvicorn"
+  - "main:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
+
+env:
+  - name: DATABRICKS_CATALOG
+    value: "catalog_j4zl8j_om2ldn"
+  - name: DATABRICKS_SCHEMA
+    value: "dev_mathieu_pelletier_mpelletier_flood_montreal_dev"
+  - name: DEFAULT_AOI
+    value: "greater_montreal"
+  - name: MAX_CELLS_PER_REQUEST
+    value: "50000"
+  # Wire the SQL warehouse binding from resources/app.yml into env vars the
+  # databricks-sql-connector understands. The service principal token is
+  # injected automatically by Databricks Apps via DATABRICKS_CLIENT_ID/SECRET.
+  - name: DATABRICKS_HOST
+    value: "adb-7405618598462441.1.azuredatabricks.net"
+  - name: DATABRICKS_HTTP_PATH
+    value: "/sql/1.0/warehouses/0334a8e49aac8b19"
