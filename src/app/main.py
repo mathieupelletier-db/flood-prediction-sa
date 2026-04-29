@@ -49,8 +49,18 @@ if not (HOST and HTTP_PATH):
     log.warning("DATABRICKS_HOST / DATABRICKS_HTTP_PATH not set - API calls will fail")
 
 
+PROFILE = os.environ.get("DATABRICKS_CONFIG_PROFILE")
+
+
 def _connect():
-    """Open a SQL warehouse connection using whichever auth mode is available."""
+    """Open a SQL warehouse connection using whichever auth mode is available.
+
+    Priority:
+    1. ``DATABRICKS_TOKEN`` (PAT) — used by Databricks Apps in production.
+    2. ``DATABRICKS_CLIENT_ID`` + ``DATABRICKS_CLIENT_SECRET`` (SP OAuth).
+    3. ``DATABRICKS_CONFIG_PROFILE`` — local dev via the CLI's stored OAuth
+       (U2M) credentials.
+    """
     kwargs: dict[str, Any] = {"server_hostname": HOST, "http_path": HTTP_PATH}
     if TOKEN:
         kwargs["access_token"] = TOKEN
@@ -59,8 +69,25 @@ def _connect():
 
         cfg = Config(host=f"https://{HOST}", client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
         kwargs["credentials_provider"] = lambda: oauth_service_principal(cfg)
+    elif PROFILE:
+        from databricks.sdk.core import Config
+
+        cfg = Config(profile=PROFILE)
+
+        def _provider():
+            def _header_factory():
+                headers = cfg.authenticate()
+                # Config.authenticate() returns a dict like {"Authorization": "Bearer ..."}
+                return headers
+
+            return _header_factory
+
+        kwargs["credentials_provider"] = _provider
     else:
-        raise RuntimeError("No Databricks auth available (set DATABRICKS_TOKEN or CLIENT_ID/SECRET)")
+        raise RuntimeError(
+            "No Databricks auth available — set DATABRICKS_TOKEN, "
+            "DATABRICKS_CLIENT_ID/SECRET, or DATABRICKS_CONFIG_PROFILE."
+        )
     return dbsql.connect(**kwargs)
 
 

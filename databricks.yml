@@ -59,7 +59,11 @@ targets:
     mode: development
     variables:
       catalog: "catalog_j4zl8j_om2ldn"
-      schema: "montreal_dev"
+      # `mode: development` auto-prefixes this with `dev_${short_user}_`, so the
+      # actual UC name lands at `catalog_j4zl8j_om2ldn.dev_mathieu_pelletier_mpelletier_flood_montreal_dev`.
+      # Do NOT include the `dev_<user>_` prefix here or it will be doubled.
+      schema: "mpelletier_flood_montreal_dev"
+      warehouse_id: "0334a8e49aac8b19"
 
   prod:
     mode: production

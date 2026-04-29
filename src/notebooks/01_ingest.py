@@ -257,17 +257,40 @@ else:
 
 from datetime import datetime as _dt
 from urllib.parse import urlencode
+import time
 
+# Single-layer service for the 2017 + 2019 ZIS decree polygons. The MapServer
+# only exposes one polygon layer (id=1) covering the combined 2017 and 2019
+# inundation extents under decree 817-2019; individual features carry the
+# decree's start date (`Date_debut`), not the flood year, so we cannot reliably
+# split the overlay into two year-coloured layers from this source alone.
 flood_path = f"{volume_root}/floods/{aoi_name}_historical.geojson"
 FLOOD_MAPSERVER = (
     "https://www.servicesgeo.enviroweb.gouv.qc.ca/donnees/rest/services/"
     "Public/Territoire_inonde_en_2017_et_2019/MapServer/1/query"
 )
+FLOOD_MAX_RECORDS = 1000  # = MapServer maxRecordCount, do not raise
+
+# Allow the user to bust the cache without manually deleting the volume file.
+dbutils.widgets.text("force_refresh_floods", "false")
+_force_refresh = dbutils.widgets.get("force_refresh_floods").strip().lower() in (
+    "1", "true", "yes")
 
 
-def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat, page_size=1000):
-    """Page through the ArcGIS Feature Service for the AOI bbox and return a
-    list of GeoJSON features with a derived `year` property."""
+def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat,
+                           page_size=FLOOD_MAX_RECORDS,
+                           max_attempts=4, base_backoff_s=2.0):
+    """Page through the ArcGIS Feature Service for the AOI bbox.
+
+    Returns a list of GeoJSON features. Each feature gets a synthetic `year`
+    property derived from the `Date_debut` decree-start date — note this is the
+    decree's effective date, not the flood occurrence date, so for the current
+    (combined 2017+2019 ZIS) layer every feature ends up tagged `'2019'`.
+
+    Raises on transport / HTTP failure after `max_attempts` retries with
+    exponential backoff. Does NOT swallow errors — caller must decide how to
+    handle them so we never silently produce an empty cache.
+    """
     features: list[dict] = []
     offset = 0
     while True:
@@ -285,12 +308,34 @@ def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat, page_size=1000):
             "resultOffset": offset,
         }
         url = f"{FLOOD_MAPSERVER}?{urlencode(params)}"
-        req = Request(url, headers={"User-Agent": "flood-demo/1.0"})
-        with urlopen(req, timeout=180) as r:
-            payload = json.loads(r.read())
+        last_err: Exception | None = None
+        payload = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                req = Request(url, headers={"User-Agent": "flood-demo/1.0"})
+                with urlopen(req, timeout=180) as r:
+                    payload = json.loads(r.read())
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < max_attempts:
+                    sleep_s = base_backoff_s * (2 ** (attempt - 1))
+                    print(f"  flood fetch offset={offset} attempt {attempt} "
+                          f"failed ({type(e).__name__}: {e}); retrying in {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+        if payload is None:
+            raise RuntimeError(
+                f"MDDELCC ArcGIS fetch failed after {max_attempts} attempts at "
+                f"offset={offset}: {last_err!r}"
+            ) from last_err
+
+        # ArcGIS surfaces server-side errors with HTTP 200 + an `error` body.
+        if isinstance(payload, dict) and payload.get("error"):
+            raise RuntimeError(
+                f"ArcGIS service returned error at offset={offset}: {payload['error']}"
+            )
+
         batch = payload.get("features", [])
-        if not batch:
-            break
         for feat in batch:
             props = feat.get("properties") or {}
             ts = props.get("Date_debut")
@@ -303,23 +348,52 @@ def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat, page_size=1000):
                 props["year"] = ""
             feat["properties"] = props
             features.append(feat)
-        if len(batch) < page_size:
+
+        # Trust ArcGIS's own pagination signal first; fall back to length check.
+        if not payload.get("exceededTransferLimit") and len(batch) < page_size:
+            break
+        if not batch:
             break
         offset += page_size
     return features
 
 
-if not os.path.exists(flood_path):
-    os.makedirs(os.path.dirname(flood_path), exist_ok=True)
+def _cache_is_usable(path: str) -> bool:
+    """A cache is usable iff it parses as a non-empty FeatureCollection.
+
+    An empty FeatureCollection is treated as missing — we'd rather re-fetch
+    than serve a confidently-empty overlay (which is what bit us before)."""
+    if not os.path.exists(path):
+        return False
     try:
-        feats = _fetch_flood_features(min_lon, min_lat, max_lon, max_lat)
-        fc = {"type": "FeatureCollection", "features": feats}
-        years = sorted({f["properties"].get("year") or "?" for f in feats})
-        print(f"Pulled {len(feats)} flood features from MDDELCC ArcGIS "
-              f"(years: {years})")
-    except Exception as e:
-        print("Flood polygon REST fetch failed, writing empty placeholder:", e)
-        fc = {"type": "FeatureCollection", "features": []}
+        with open(path) as f:
+            fc = json.load(f)
+    except Exception:
+        return False
+    return (isinstance(fc, dict)
+            and fc.get("type") == "FeatureCollection"
+            and bool(fc.get("features")))
+
+
+if _force_refresh or not _cache_is_usable(flood_path):
+    if _force_refresh and os.path.exists(flood_path):
+        print("force_refresh_floods=true; ignoring existing cache at", flood_path)
+    elif os.path.exists(flood_path):
+        print("Existing flood cache is empty/malformed, re-fetching:", flood_path)
+    os.makedirs(os.path.dirname(flood_path), exist_ok=True)
+    feats = _fetch_flood_features(min_lon, min_lat, max_lon, max_lat)
+    if not feats:
+        # 0 features is itself suspicious for a non-trivial AOI — surface it.
+        raise RuntimeError(
+            "MDDELCC ArcGIS returned 0 flood polygons for AOI "
+            f"({min_lon},{min_lat})->({max_lon},{max_lat}). Verify the bbox "
+            "intersects the 2017/2019 ZIS extents, or the upstream service "
+            "schema. Refusing to write an empty cache."
+        )
+    fc = {"type": "FeatureCollection", "features": feats}
+    years = sorted({f["properties"].get("year") or "?" for f in feats})
+    print(f"Pulled {len(feats)} flood features from MDDELCC ArcGIS "
+          f"(years: {years}; note: derived from decree Date_debut, not flood date)")
     with open(flood_path, "w") as f:
         json.dump(fc, f)
 else:
@@ -383,12 +457,34 @@ hydro_df = spark.createDataFrame(
         .saveAsTable(f"{bronze_ns}.bronze_hydrography"))
 
 # Historical flood polygons -> bronze
+# `year` is synthesized in `_fetch_flood_features` from the decree start date
+# and is the only year-like field present in the MDDELCC layer; older
+# Données Québec exports of "Limites des zones inondées" used `annee`, kept as
+# a fallback so the cache remains forward/backward-compatible if the upstream
+# source is swapped.
 with open(flood_path) as f:
     flood_fc = json.load(f)
+
+
+def _coords_to_2d(coords):
+    # MDDELCC ArcGIS emits XYZM positions like [lon, lat, 0, null]; the null M
+    # value breaks ST_GeomFromGeoJSON. Trim every position to [lon, lat].
+    if (coords and isinstance(coords, list)
+            and coords and not isinstance(coords[0], list)):
+        return coords[:2]
+    return [_coords_to_2d(c) for c in coords]
+
+
+def _geom_to_2d(geom):
+    if not geom or geom.get("type") == "GeometryCollection":
+        return geom
+    return {**geom, "coordinates": _coords_to_2d(geom["coordinates"])}
+
+
 flood_rows = [
-    (aoi_name, str(feat.get("properties", {}).get("annee")
-                   or feat.get("properties", {}).get("year") or ""),
-     json.dumps(feat["geometry"]))
+    (aoi_name, str(feat.get("properties", {}).get("year")
+                   or feat.get("properties", {}).get("annee") or ""),
+     json.dumps(_geom_to_2d(feat["geometry"])))
     for feat in flood_fc["features"]
 ]
 flood_df = spark.createDataFrame(
