@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PickingInfo } from "@deck.gl/core";
 import { FloodMap, THEMES, type ViewState, type MapTheme } from "./FloodMap";
 import { AddressCard } from "./AddressCard";
@@ -25,7 +25,7 @@ export default function App() {
   const [scenarios, setScenarios] = useState<number[]>([]);
   const [scenarioMm, setScenarioMm] = useState(60);
   const [threshold, setThreshold] = useState(0.4);
-  const [showFloods, setShowFloods] = useState(true);
+  const [showFloods, setShowFloods] = useState(false);
   const [theme, setTheme] = useState<MapTheme>(() => {
     const saved = localStorage.getItem("flood-map-theme");
     return (saved === "dark" || saved === "light" || saved === "voyager") ? saved : "dark";
@@ -37,8 +37,12 @@ export default function App() {
   }, [theme]);
   const [cells, setCells] = useState<PredictionCell[]>([]);
   const [events, setEvents] = useState<FloodEvent[]>([]);
+  // Cache the (potentially large) flood-overlay polygons per AOI so toggling
+  // the overlay off/on doesn't refetch.
+  const eventsCacheRef = useRef<Map<string, FloodEvent[]>>(new Map());
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [loading, setLoading] = useState(false);
+  const [overlayLoading, setOverlayLoading] = useState(false);
   const [view, setView] = useState<ViewState>(DEFAULT_VIEW);
   const [hover, setHover] = useState<PickingInfo | null>(null);
   const [addressHit, setAddressHit] = useState<AddressLookup | null>(null);
@@ -88,13 +92,11 @@ export default function App() {
     const snapped = snap(scenarioMm, scenarios);
     Promise.all([
       api.predictions(aoi, snapped, threshold),
-      api.floodEvents(aoi),
       api.metrics(aoi, snapped, Math.max(0.5, threshold)),
     ])
-      .then(([p, e, m]) => {
+      .then(([p, m]) => {
         if (cancelled) return;
         setCells(p.cells);
-        setEvents(e.events);
         setMetrics(m);
       })
       .catch((err) => console.error(err))
@@ -103,6 +105,51 @@ export default function App() {
       cancelled = true;
     };
   }, [aoi, scenarioMm, threshold, scenarios]);
+
+  // Lazy + batched flood-overlay loader. Only runs when the user actually
+  // toggles the overlay on, fetches one year at a time in parallel, and
+  // appends each batch to state so the map paints them progressively
+  // instead of waiting for one giant payload.
+  useEffect(() => {
+    if (!showFloods) {
+      setOverlayLoading(false);
+      return;
+    }
+    const cached = eventsCacheRef.current.get(aoi);
+    if (cached) {
+      setEvents(cached);
+      setOverlayLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setEvents([]);
+    setOverlayLoading(true);
+    const acc: FloodEvent[] = [];
+    (async () => {
+      try {
+        const years = await api.floodEventYears(aoi);
+        if (cancelled) return;
+        const list = years.length ? years : [undefined];
+        await Promise.all(
+          list.map(async (y) => {
+            const r = await api.floodEvents(aoi, y);
+            if (cancelled) return;
+            acc.push(...r.events);
+            setEvents([...acc]);
+          }),
+        );
+        if (!cancelled) eventsCacheRef.current.set(aoi, acc);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        if (!cancelled) setOverlayLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      setOverlayLoading(false);
+    };
+  }, [aoi, showFloods]);
 
   const onHover = useCallback((info: PickingInfo) => setHover(info), []);
 
@@ -232,6 +279,7 @@ export default function App() {
             onChange={(e) => setShowFloods(e.target.checked)}
           />
           Overlay 2017/2019 historical floods
+          {overlayLoading && <span className="toggle-loading">loading…</span>}
         </label>
 
         <div className="metrics">
@@ -305,6 +353,9 @@ export default function App() {
       </div>
 
       {loading && <div className="spinner">Loading predictions...</div>}
+      {overlayLoading && !loading && (
+        <div className="spinner">Loading historical flood overlay…</div>
+      )}
       {tooltip}
     </div>
   );

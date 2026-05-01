@@ -28,6 +28,20 @@ html, body, #root { margin: 0; padding: 0; height: 100%; width: 100%; background
 .row .value { width: 42px; text-align: right; color: #e6edf3; }
 
 .toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #adb5bd; margin-bottom: 8px; cursor: pointer; user-select: none; }
+.toggle-loading {
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(88, 166, 255, 0.15);
+  color: #58a6ff;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  animation: toggle-pulse 1.2s ease-in-out infinite;
+}
+@keyframes toggle-pulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
+}
 
 .segmented { display: inline-flex; background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; flex: 1; }
 .segmented button {

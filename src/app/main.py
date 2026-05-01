@@ -23,6 +23,7 @@ import h3
 import requests
 from databricks import sql as dbsql
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -198,6 +199,8 @@ class AddressLookup(BaseModel):
 # App --------------------------------------------------------------------------
 
 app = FastAPI(title="Flood Prediction API", version="0.1.0")
+# GeoJSON compresses ~5-10x. Skip tiny payloads where the overhead doesn't pay off.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.get("/api/health")
@@ -302,6 +305,18 @@ def predictions(
         aoi_name=aoi, scenario_24h_mm=scenario,
         threshold=threshold, count=len(cells), cells=cells,
     )
+
+
+@app.get("/api/flood_event_years", response_model=list[str])
+def flood_event_years(aoi: str = Query(default=DEFAULT_AOI)) -> list[str]:
+    """Distinct years available for the AOI - lets the client batch the
+    overlay download one year at a time and render each batch as it arrives."""
+    rows = _fetch(
+        f"SELECT DISTINCT year FROM {NS}.gold_flood_events"
+        " WHERE aoi_name = ? AND year IS NOT NULL ORDER BY year",
+        (aoi,),
+    )
+    return [str(r["year"]) for r in rows]
 
 
 @app.get("/api/flood_events", response_model=FloodEventsResponse)

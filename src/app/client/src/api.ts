@@ -79,8 +79,13 @@ export const api = {
       `/api/predictions?aoi=${encodeURIComponent(aoi)}&scenario_mm=${scenarioMm}` +
         `&threshold=${threshold}&limit=${limit}`,
     ),
-  floodEvents: (aoi: string) =>
-    fetchJson<FloodEventsResponse>(`/api/flood_events?aoi=${encodeURIComponent(aoi)}`),
+  floodEventYears: (aoi: string) =>
+    fetchJson<string[]>(`/api/flood_event_years?aoi=${encodeURIComponent(aoi)}`),
+  floodEvents: (aoi: string, year?: string) => {
+    const qs = new URLSearchParams({ aoi });
+    if (year) qs.set("year", year);
+    return fetchJson<FloodEventsResponse>(`/api/flood_events?${qs}`);
+  },
   metrics: (aoi: string, scenarioMm: number, threshold: number) =>
     fetchJson<Metrics>(
       `/api/metrics?aoi=${encodeURIComponent(aoi)}&scenario_mm=${scenarioMm}&threshold=${threshold}`,
