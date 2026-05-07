@@ -1,23 +1,27 @@
-# Flood Prediction Demo - Greater Montreal
+# Flood Prediction Solution Accelerator
+
+[![Databricks](https://img.shields.io/badge/Databricks-Solution_Accelerator-FF3621?style=for-the-badge&logo=databricks)](https://databricks.com)
+[![Unity Catalog](https://img.shields.io/badge/Unity_Catalog-Enabled-00A1C9?style=for-the-badge)](https://docs.databricks.com/en/data-governance/unity-catalog/index.html)
+[![Serverless](https://img.shields.io/badge/Serverless-Compute-00C851?style=for-the-badge)](https://docs.databricks.com/en/compute/serverless.html)
 
 End-to-end flood prediction pipeline on Databricks, combining:
 
 - **GeoBrix RasterX** for raster ingestion, clipping, slope derivation and H3 tessellation
-  of a digital elevation model.
+of a digital elevation model.
 - **Databricks Spatial SQL** (`ST_*` and `h3_*` built-ins, DBR 17.1+) for vector
-  operations (distance to water, intersection with historical flood polygons,
-  nearest-neighbour precipitation assignment).
+operations (distance to water, intersection with historical flood polygons,
+nearest-neighbour precipitation assignment).
 - **Open-Meteo ERA5 historical archive** for 10+ years of daily precipitation on
-  a 0.1-degree grid, summarised into per-cell climatology (annual total, P99 24h,
-  P99 5-day).
+a 0.1-degree grid, summarised into per-cell climatology (annual total, P99 24h,
+P99 5-day).
 - **Spark ML `RandomForestClassifier`** trained on a **rainfall-scenario-expanded**
-  dataset (each H3 cell replicated across multiple 24h rainfall levels) so the
-  model learns an actual rainfall response, with **MLflow** tracking and Unity
-  Catalog model registration.
+dataset (each H3 cell replicated across multiple 24h rainfall levels) so the
+model learns an actual rainfall response, with **MLflow** tracking and Unity
+Catalog model registration.
 - A **Databricks App** (FastAPI + React + deck.gl) that visualises per-H3 flood
-  probability over a dark basemap, with an **interactive 24-hour rainfall slider**
-  that switches between pre-scored rainfall partitions, plus a toggleable overlay
-  of the 2017 / 2019 historical flood polygons for validation.
+probability over a dark basemap, with an **interactive 24-hour rainfall slider**
+that switches between pre-scored rainfall partitions, plus a toggleable overlay
+of the 2017 / 2019 historical flood polygons for validation.
 
 The ingestion is **parameterised by AOI**; the default is a bbox around Greater
 Montreal but any bbox can be passed via bundle variables to retarget the demo at a
@@ -30,17 +34,21 @@ flood-prediction-sa/
 │   ├── storage.yml             # Schema, Volume, registered model
 │   ├── pipeline.yml            # Job wiring the 4 notebooks + GeoBrix libraries
 │   └── app.yml                 # Databricks App resource
+├── notebooks/
+│   ├── 01_ingest.py                  # DEM + hydro + flood polygons  ->  bronze Delta
+│   ├── 02_silver_geobrix.py          # RasterX + Spatial SQL          ->  silver H3 tables
+│   ├── 03_gold_features_labels.py    # Feature engineering + hybrid labels
+│   └── 04_train_and_score.py         # Spark ML, MLflow, scored Delta
 ├── src/
-│   ├── notebooks/
-│   │   ├── 01_ingest.py              # DEM + hydro + flood polygons  ->  bronze Delta
-│   │   ├── 02_silver_geobrix.py      # RasterX + Spatial SQL          ->  silver H3 tables
-│   │   ├── 03_gold_features_labels.py# Feature engineering + hybrid labels
-│   │   └── 04_train_and_score.py     # Spark ML, MLflow, scored Delta
-│   └── app/                          # Databricks App
-│       ├── app.yaml                  # Databricks Apps launch config
-│       ├── main.py                   # FastAPI backend
-│       ├── requirements.txt
-│       └── client/                   # React + deck.gl SPA
+│   ├── app/                          # Databricks App
+│   │   ├── app.yaml                  # Databricks Apps launch config
+│   │   ├── main.py                   # FastAPI backend
+│   │   ├── requirements.txt
+│   │   └── client/                   # React + deck.gl SPA
+│   └── bootstrap/                    # GeoBrix init script + wheel for the job cluster
+├── scripts/cleanup.sh                # Helper for `databricks bundle destroy`
+├── requirements.txt                  # Local dev / IDE deps
+├── LICENSE.md / NOTICE.md / CONTRIBUTING.md / SECURITY.md
 └── README.md
 ```
 
@@ -84,6 +92,8 @@ flowchart LR
   G2 --> APP
 ```
 
+
+
 ## Parameterisation
 
 Change a city by overriding bundle variables at deploy time, or edit the defaults
@@ -91,6 +101,8 @@ in `databricks.yml`:
 
 ```bash
 databricks bundle deploy -t dev \
+  --var="catalog=<your_catalog>" \
+  --var="schema=<your_schema>" \
   --var="aoi_name=quebec_city" \
   --var='aoi_bbox_wkt=POLYGON((-71.40 46.70, -71.10 46.70, -71.10 46.90, -71.40 46.90, -71.40 46.70))' \
   --var="aoi_bbox_min_lon=-71.40" --var="aoi_bbox_min_lat=46.70" \
@@ -99,6 +111,51 @@ databricks bundle deploy -t dev \
 
 The same Delta tables are partitioned by `aoi_name`, so multiple AOIs can coexist
 and be switched in the app via the AOI dropdown.
+
+## Historical flood polygon source (`flood_source`)
+
+`bronze_flood_events` and the App's validation overlay come from one of three
+sources, selected via the `flood_source` bundle variable:
+
+| `flood_source` | What it pulls | Coverage | When to use |
+|---|---|---|---|
+| `melcc` *(default)* | Quebec MDDELCC ArcGIS service for the 2017 + 2019 ZIS decree polygons | Quebec only | Default Montreal demo and any other Quebec AOI |
+| `cems` | [Copernicus EMS Rapid Mapping](https://emergency.copernicus.eu/mapping/list-of-activations-rapid) GeoJSON products you point at via `cems_urls`, or any GeoJSON files dropped in `<volume>/floods/cems_input/` | Global, but only major declared events | Any non-Quebec AOI where a CEMS activation exists |
+| `none` | Writes an empty `bronze_flood_events`. The model still trains on the synthetic susceptibility label; the historical-flood overlay and live precision/recall readout disappear from the App | Any | Any AOI with no historical-flood data we trust |
+
+CEMS example — Cedar Rapids 2008 floods (activation EMSR007):
+
+```bash
+databricks bundle deploy -t dev \
+  --var="aoi_name=cedar_rapids" \
+  --var="aoi_bbox_min_lon=-91.80" --var="aoi_bbox_min_lat=41.90" \
+  --var="aoi_bbox_max_lon=-91.55" --var="aoi_bbox_max_lat=42.10" \
+  --var='aoi_bbox_wkt=POLYGON((-91.80 41.90, -91.55 41.90, -91.55 42.10, -91.80 42.10, -91.80 41.90))' \
+  --var="flood_source=cems" \
+  --var="cems_urls=https://emergency.copernicus.eu/.../EMSR007_AOI01_observed_event_a.geojson,https://emergency.copernicus.eu/.../EMSR007_AOI02_observed_event_a.geojson" \
+  --var="cems_year_default=2008"
+```
+
+If the GeoJSON URL isn't readily linkable from the activation page, just download
+the GeoJSON locally and upload it to
+`/Volumes/<catalog>/<schema>/raw/<aoi_name>/floods/cems_input/`. Notebook 01 picks
+up everything in that directory and merges it. Filenames containing a 4-digit
+year (e.g. `EMSR201_aoi01_2017_DEL.geojson`) get auto-tagged for the App's
+per-year overlay; everything else falls back to `cems_year_default`.
+
+> **Why GeoJSON only?** Most CEMS Rapid Mapping products are also offered as
+> GeoJSON in addition to Shapefile. Supporting Shapefile zips in-notebook would
+> drag in a heavy GDAL/fiona dependency for marginal benefit — pick the GeoJSON
+> download from the CEMS portal instead.
+
+Skip mode for AOIs with no historical data:
+
+```bash
+databricks bundle deploy -t dev \
+  --var="aoi_name=miami" \
+  --var=... \
+  --var="flood_source=none"
+```
 
 ## Rainfall scenarios
 
@@ -122,20 +179,20 @@ them up automatically via `/api/scenarios`.
 - Unity Catalog workspace on AWS or Azure with:
   - DBR **17.1+** runtime available (needed for built-in Spatial SQL).
   - A **Serverless SQL Warehouse** the app can bind to. Note its id and set
-    `var.warehouse_id` (or the `DATABRICKS_WAREHOUSE_ID` env in the bundle target).
+  `var.warehouse_id` (or the `DATABRICKS_WAREHOUSE_ID` env in the bundle target).
   - GeoBrix installed on the job cluster. The `resources/pipeline.yml` task uses
-    both the Maven bundle and the `databricks-labs-geobrix` PyPI wheel - pin the
-    exact versions your workspace supports (see
-    [GeoBrix docs](https://databrickslabs.github.io/geobrix/docs/installation)).
+  both the Maven bundle and the `databricks-labs-geobrix` PyPI wheel - pin the
+  exact versions your workspace supports (see
+  [GeoBrix docs](https://databrickslabs.github.io/geobrix/docs/installation)).
 - The Databricks CLI 0.239.0+ (for Apps resource support).
-- `bun` (or `npm`) locally if you want to build the React SPA before deploy.
+- `npm` (or `bun`) locally if you want to build the React SPA before deploy.
 
 ## Build the React SPA
 
 ```bash
 cd src/app/client
-bun install           # or: npm ci
-bun run build         # emits ./dist
+npm ci                # or: bun install
+npm run build         # emits ./dist  (or: bun run build)
 cd ../../..
 ```
 
@@ -155,7 +212,21 @@ databricks bundle run flood_pipeline -t dev
 # 3. Start the Databricks App
 databricks bundle run flood_app -t dev
 
-# 4. (Optional) stream logs
+# 4. One-time per workspace: grant the app's auto-created service principal
+#    USE CATALOG on the target catalog. Schema-level USE_SCHEMA + SELECT are
+#    already declared in resources/storage.yml and applied by `bundle deploy`.
+SP_ID=$(databricks apps get flood-prediction-dev --output json \
+          | jq -r .service_principal_client_id)
+databricks api post /api/2.0/sql/statements/ --json "$(cat <<EOF
+{
+  "warehouse_id": "<your-warehouse-id>",
+  "statement": "GRANT USE CATALOG ON CATALOG \`<your-catalog>\` TO \`${SP_ID}\`",
+  "wait_timeout": "30s"
+}
+EOF
+)"
+
+# 5. (Optional) stream logs
 databricks apps logs flood-prediction-dev
 ```
 
@@ -178,33 +249,75 @@ uvicorn main:app --reload --port 8000
 
 # Terminal 2 - frontend (Vite dev server proxies /api to :8000)
 cd src/app/client
-bun run dev
+npm run dev           # or: bun run dev
 ```
 
 ## Notes and trade-offs
 
 - **DEM resolution.** We use SRTM 1-arc-second (~30 m) because it's globally
-  available from AWS Open Data without auth. For a real demo in Montreal you can
-  swap in **HRDEM** (1 m) from NRCan - change `01_ingest.py::build_dem` and keep
-  everything else the same. The pipeline is tile-agnostic.
+available from AWS Open Data without auth. For a real demo in Montreal you can
+swap in **HRDEM** (1 m) from NRCan - change `01_ingest.py::build_dem` and keep
+everything else the same. The pipeline is tile-agnostic.
 - **Labels are hybrid.** Training uses a rainfall-aware synthetic label
-  (susceptibility from low elevation + near water + low slope + wet climatology,
-  multiplied by a rainfall factor that saturates at ~150 mm) because real flood
-  polygons cover a small fraction of cells. Each cell is replicated across the
-  configured rainfall scenarios so the model actually learns the rainfall
-  response. The real 2017 / 2019 labels are held out and used only for
-  validation metrics and the map overlay - this is the right pattern to show
-  since a production pipeline would later replace the synthetic signal with
-  expanded historical data, insurance claims, radar-based QPE, etc.
+(susceptibility from low elevation + near water + low slope + wet climatology,
+multiplied by a rainfall factor that saturates at ~150 mm) because real flood
+polygons cover a small fraction of cells. Each cell is replicated across the
+configured rainfall scenarios so the model actually learns the rainfall
+response. The real 2017 / 2019 labels are held out and used only for
+validation metrics and the map overlay - this is the right pattern to show
+since a production pipeline would later replace the synthetic signal with
+expanded historical data, insurance claims, radar-based QPE, etc.
 - **H3 resolution** defaults to 9 (~174 m edge). Drop to 8 for fewer, larger
-  cells or go to 10 for finer detail at higher compute cost.
+cells or go to 10 for finer detail at higher compute cost.
 - **Spatial SQL requirement.** Notebooks `02` and `03` rely on DBR 17.1+ built-in
-  `ST_*` and `h3_*` functions. If running on older DBR, swap `ST_Distance` /
-  `ST_Intersects` for GeoBrix `VectorX` equivalents and `h3_centerasgeojson` for
-  the H3 library's Python UDFs.
+`ST_`* and `h3_*` functions. If running on older DBR, swap `ST_Distance` /
+`ST_Intersects` for GeoBrix `VectorX` equivalents and `h3_centerasgeojson` for
+the H3 library's Python UDFs.
 
 ## Cleanup
 
 ```bash
 databricks bundle destroy -t dev
+# or use the helper:
+./scripts/cleanup.sh
 ```
+
+## Third-Party Package Licenses
+
+&copy; 2026 Databricks, Inc. All rights reserved. The source in this project is provided subject to the Databricks License [https://databricks.com/db-license-source]. All included or referenced third party libraries and data sources are subject to the licenses set forth below.
+
+### Python / JVM libraries
+
+| Package | License | Copyright |
+|---------|---------|-----------|
+| `databricks-labs-geobrix` (RasterX, JAR + wheel) | Databricks License | Databricks, Inc. |
+| `pyspark` | Apache 2.0 | The Apache Software Foundation |
+| `mlflow` | Apache 2.0 | Databricks, Inc. |
+| `databricks-sdk` | Apache 2.0 | Databricks, Inc. |
+| `h3` (uber-h3-py) | Apache 2.0 | Uber Technologies, Inc. |
+| `rasterio` | BSD-3-Clause | MapBox |
+| `shapely` | BSD-3-Clause | Sean Gillies and contributors |
+| `requests` | Apache 2.0 | Kenneth Reitz |
+
+### App (FastAPI + React) libraries
+
+| Package | License | Copyright |
+|---------|---------|-----------|
+| `fastapi` | MIT | Sebastián Ramírez |
+| `uvicorn` | BSD-3-Clause | Encode OSS Ltd. |
+| `databricks-sql-connector` | Apache 2.0 | Databricks, Inc. |
+| `react`, `react-dom` | MIT | Meta Platforms, Inc. |
+| `vite` | MIT | Evan You and Vite contributors |
+| `deck.gl` | MIT | Uber Technologies, Inc. |
+| `maplibre-gl` | BSD-3-Clause | MapLibre contributors |
+
+### Data sources
+
+| Dataset | License / Terms | Source |
+|---------|-----------------|--------|
+| SRTM 1-arc-second DEM | Public domain (US Government work) | USGS / NASA, distributed via AWS Open Data |
+| OpenStreetMap water + rivers | ODbL 1.0 | OpenStreetMap contributors |
+| Open-Meteo ERA5 historical archive | CC-BY 4.0 | Open-Meteo, derived from Copernicus ERA5 |
+| Quebec 2017 / 2019 historical flood polygons | Creative Commons Attribution 4.0 (Données Québec) | Gouvernement du Québec / MELCC |
+
+

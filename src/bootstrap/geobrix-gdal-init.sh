@@ -6,18 +6,27 @@
 # and executors. Does NOT require a Databricks Volume (it fetches artifacts
 # at cluster startup), which keeps this demo deployable on workspaces whose
 # default storage binding can't create managed volumes.
-set -euxo pipefail
+#
+# NOTE: We deliberately do NOT use `set -e` here. The upstream
+# databrickslabs/geobrix script tolerates transient nonzero exits from
+# add-apt-repository (e.g. launchpad warnings) and we mirror that.
+set -uxo pipefail
 
 GEOBRIX_VERSION="0.2.0"
 RELEASE="https://github.com/databrickslabs/geobrix/releases/download/v${GEOBRIX_VERSION}"
 
-# ---- apt sources + ubuntugis PPA ----
-sudo add-apt-repository -y "deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)-backports main universe multiverse restricted"
-sudo add-apt-repository -y "deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)-updates    main universe multiverse restricted"
-sudo add-apt-repository -y "deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)-security   main multiverse restricted universe"
-sudo add-apt-repository -y "deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)            main multiverse restricted universe"
-
+# ---- software-properties-common FIRST (provides add-apt-repository) ----
+# Must be installed before any add-apt-repository call.
+sudo apt-get update -y || true
 sudo apt-get install -y software-properties-common
+
+# ---- ubuntugis PPA only ----
+# DBR 17.3 runs Ubuntu 24.04 (Noble), which already configures
+# main/universe/multiverse/restricted for noble + noble-updates + noble-security
+# + noble-backports via /etc/apt/sources.list.d/ubuntu.sources (deb822 format).
+# The upstream geobrix-gdal-init.sh re-adds those sources via the legacy `deb`
+# format; on Noble that creates duplicate-source warnings and an apt-get update
+# retry loop that can hang the init script for 30+ minutes. We skip them.
 sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
 sudo apt-get update -y
 
@@ -34,13 +43,17 @@ export GDAL_CONFIG=/usr/bin/gdal-config
 pip install --no-cache-dir --force-reinstall "GDAL[numpy]==$(gdal-config --version).*"
 
 # ---- GeoBrix JAR + GDAL JNI shared object (from GitHub releases) ----
+# Fail loudly if the downloads don't succeed - these are required.
 TMP=$(mktemp -d)
 cd "$TMP"
-curl -fsSL -o geobrix.jar  "${RELEASE}/geobrix-${GEOBRIX_VERSION}-jar-with-dependencies.jar"
-curl -fsSL -o libgdalalljni.so "${RELEASE}/libgdalalljni.so"
+curl -fSL --retry 5 --retry-delay 5 -o geobrix.jar       "${RELEASE}/geobrix-${GEOBRIX_VERSION}-jar-with-dependencies.jar" \
+  || { echo "FATAL: failed to download geobrix jar"; exit 1; }
+curl -fSL --retry 5 --retry-delay 5 -o libgdalalljni.so "${RELEASE}/libgdalalljni.so" \
+  || { echo "FATAL: failed to download libgdalalljni.so"; exit 1; }
 
 sudo cp libgdalalljni.so /usr/lib/libgdalalljni.so
-sudo cp geobrix.jar       /databricks/jars/geobrix-${GEOBRIX_VERSION}.jar
+sudo mkdir -p /databricks/jars
+sudo cp geobrix.jar      /databricks/jars/geobrix-${GEOBRIX_VERSION}.jar
 
 cd / && rm -rf "$TMP"
 echo "GeoBrix ${GEOBRIX_VERSION} init script finished."

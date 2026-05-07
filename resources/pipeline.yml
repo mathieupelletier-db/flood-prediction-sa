@@ -12,12 +12,19 @@ resources:
           new_cluster:
             # GeoBrix v0.2.0 targets DBR 17.3; DBR 17.1+ has built-in Spatial SQL.
             spark_version: "17.3.x-scala2.13"
-            node_type_id: "Standard_DS3_v2"  # Azure equivalent of ~4 vCPU / 14 GB
+            # Modern AMD v5 SKU - 4 vCPU / 16 GB. Switched from Standard_DS3_v2
+            # because that older SKU hits regional capacity limits.
+            node_type_id: "Standard_D4ads_v5"
             num_workers: 2
             data_security_mode: SINGLE_USER
             runtime_engine: STANDARD
             spark_conf:
               spark.databricks.geo.st.enabled: "true"
+            # Stream init-script + driver/executor logs to the demo volume so
+            # we can `cat` them when something like INIT_SCRIPT_FAILURE happens.
+            cluster_log_conf:
+              volumes:
+                destination: /Volumes/${var.catalog}/${resources.schemas.flood_schema.name}/${var.volume}/_cluster_logs
             init_scripts:
               # Workspace-file init script fetches GeoBrix JAR + native libs
               # from the public GitHub release at cluster start; no Volume needed.
@@ -28,7 +35,7 @@ resources:
         - task_key: ingest
           job_cluster_key: geobrix_cluster
           notebook_task:
-            notebook_path: ../src/notebooks/01_ingest.py
+            notebook_path: ../notebooks/01_ingest.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${resources.schemas.flood_schema.name}
@@ -38,6 +45,9 @@ resources:
               aoi_bbox_max_lon: ${var.aoi_bbox_max_lon}
               aoi_bbox_max_lat: ${var.aoi_bbox_max_lat}
               raw_root: /Volumes/${var.catalog}/${resources.schemas.flood_schema.name}/${var.volume}
+              flood_source: ${var.flood_source}
+              cems_urls: ${var.cems_urls}
+              cems_year_default: ${var.cems_year_default}
           libraries:
             - pypi:
                 package: "requests==2.32.3"
@@ -49,7 +59,7 @@ resources:
             - task_key: ingest
           job_cluster_key: geobrix_cluster
           notebook_task:
-            notebook_path: ../src/notebooks/02_silver_geobrix.py
+            notebook_path: ../notebooks/02_silver_geobrix.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${resources.schemas.flood_schema.name}
@@ -72,7 +82,7 @@ resources:
             - task_key: silver
           job_cluster_key: geobrix_cluster
           notebook_task:
-            notebook_path: ../src/notebooks/03_gold_features_labels.py
+            notebook_path: ../notebooks/03_gold_features_labels.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${resources.schemas.flood_schema.name}
@@ -88,7 +98,7 @@ resources:
             - task_key: gold
           job_cluster_key: geobrix_cluster
           notebook_task:
-            notebook_path: ../src/notebooks/04_train_and_score.py
+            notebook_path: ../notebooks/04_train_and_score.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${resources.schemas.flood_schema.name}

@@ -45,9 +45,22 @@ variables:
     description: "Comma-separated list of 24h rainfall scenarios (mm) to pre-score. Each becomes a partition in gold_h3_flood_predictions and a tick on the app's rainfall slider."
     default: "10,30,60,100,150,200"
 
-  warehouse_id:
-    description: "Serverless SQL warehouse the app queries"
+  flood_source:
+    description: "Source for historical flood polygons. 'melcc' = Quebec MDDELCC ArcGIS (Quebec only). 'cems' = Copernicus Emergency Management Service (global; provide cems_urls). 'none' = skip; bronze_flood_events stays empty and the App's validation overlay disappears."
+    default: "melcc"
+
+  cems_urls:
+    description: "Comma-separated list of direct HTTPS URLs to GeoJSON or zipped Shapefile flood-extent products from CEMS Rapid Mapping (https://emergency.copernicus.eu/mapping/list-of-activations-rapid). Only consulted when flood_source=cems. Filenames containing a 4-digit year (e.g. 2017) are auto-tagged for the App's per-year overlay; everything else falls back to the cems_year_default value."
     default: ""
+
+  cems_year_default:
+    description: "Year tag applied to CEMS features whose source filename has no 4-digit year token. Used only when flood_source=cems."
+    default: ""
+
+  warehouse_id:
+    description: "Serverless SQL warehouse the app queries. Resolved via lookup by default; override with --var=warehouse_id=<id> if you don't have a warehouse named 'Shared Unity Catalog Serverless'."
+    lookup:
+      warehouse: "Shared Unity Catalog Serverless"
 
   model_name:
     description: "3-part UC model name"
@@ -57,16 +70,6 @@ targets:
   dev:
     default: true
     mode: development
-    variables:
-      catalog: "catalog_j4zl8j_om2ldn"
-      # `mode: development` auto-prefixes this with `dev_${short_user}_`, so the
-      # actual UC name lands at `catalog_j4zl8j_om2ldn.dev_mathieu_pelletier_mpelletier_flood_montreal_dev`.
-      # Do NOT include the `dev_<user>_` prefix here or it will be doubled.
-      schema: "mpelletier_flood_montreal_dev"
-      warehouse_id: "0334a8e49aac8b19"
 
   prod:
     mode: production
-    variables:
-      catalog: "catalog_j4zl8j_om2ldn"
-      schema: "montreal"

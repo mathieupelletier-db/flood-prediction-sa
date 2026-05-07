@@ -8,7 +8,7 @@ command:
 
 env:
   - name: DATABRICKS_CATALOG
-    value: "catalog_j4zl8j_om2ldn"
+    value: "classic_stable_2cn624"
   - name: DATABRICKS_SCHEMA
     value: "dev_mathieu_pelletier_mpelletier_flood_montreal_dev"
   - name: DEFAULT_AOI
@@ -19,6 +19,6 @@ env:
   # databricks-sql-connector understands. The service principal token is
   # injected automatically by Databricks Apps via DATABRICKS_CLIENT_ID/SECRET.
   - name: DATABRICKS_HOST
-    value: "adb-7405618598462441.1.azuredatabricks.net"
+    value: "adb-7405612117836809.9.azuredatabricks.net"
   - name: DATABRICKS_HTTP_PATH
-    value: "/sql/1.0/warehouses/0334a8e49aac8b19"
+    value: "/sql/1.0/warehouses/e921c86338f3e272"
