@@ -23,9 +23,11 @@ probability over a dark basemap, with an **interactive 24-hour rainfall slider**
 that switches between pre-scored rainfall partitions, plus a toggleable overlay
 of the 2017 / 2019 historical flood polygons for validation.
 
-The ingestion is **parameterised by AOI**; the default is a bbox around Greater
-Montreal but any bbox can be passed via bundle variables to retarget the demo at a
-different city.
+The ingestion is **parameterised by a list of AOIs** (`var.aois_json`). The
+pipeline fans out per AOI via a `for_each_task`, and every Delta table is
+partitioned by `aoi_name` so multiple cities co-exist in the same catalog and
+appear side-by-side in the App's AOI dropdown. The default registry ships
+Greater Montreal + Manhattan; add or override entries to retarget any city.
 
 ```
 flood-prediction-sa/
@@ -96,21 +98,57 @@ flowchart LR
 
 ## Parameterisation
 
-Change a city by overriding bundle variables at deploy time, or edit the defaults
-in `databricks.yml`:
+### The AOI registry (`var.aois_json`)
+
+`databricks.yml` defines a JSON-array variable `aois_json`. The pipeline job is
+a stack of `for_each_task` stages that iterate over this list, so each AOI gets
+its own ingest → silver → gold → train_and_score run, all writing into the
+same catalog under their own `aoi_name` partition.
+
+The default registry contains two entries: Greater Montreal (with MELCC flood
+polygons) and Manhattan (no historical floods). To retarget the demo, edit the
+list in `databricks.yml` or override at deploy time:
 
 ```bash
-databricks bundle deploy -t dev \
-  --var="catalog=<your_catalog>" \
-  --var="schema=<your_schema>" \
-  --var="aoi_name=quebec_city" \
-  --var='aoi_bbox_wkt=POLYGON((-71.40 46.70, -71.10 46.70, -71.10 46.90, -71.40 46.90, -71.40 46.70))' \
-  --var="aoi_bbox_min_lon=-71.40" --var="aoi_bbox_min_lat=46.70" \
-  --var="aoi_bbox_max_lon=-71.10" --var="aoi_bbox_max_lat=46.90"
+# Replace the registry inline
+databricks bundle deploy -t dev --var='aois_json=[
+  {"name":"greater_montreal","min_lon":"-74.05","min_lat":"45.30","max_lon":"-73.30","max_lat":"45.80","wkt":"POLYGON((-74.05 45.30, -73.30 45.30, -73.30 45.80, -74.05 45.80, -74.05 45.30))","flood_source":"melcc","cems_urls":"","cems_year_default":""},
+  {"name":"quebec_city","min_lon":"-71.40","min_lat":"46.70","max_lon":"-71.10","max_lat":"46.90","wkt":"POLYGON((-71.40 46.70, -71.10 46.70, -71.10 46.90, -71.40 46.90, -71.40 46.70))","flood_source":"melcc","cems_urls":"","cems_year_default":""}
+]'
+
+# Or keep the registry in a file
+databricks bundle deploy -t dev --var="aois_json=$(cat my_aois.json)"
 ```
 
-The same Delta tables are partitioned by `aoi_name`, so multiple AOIs can coexist
-and be switched in the app via the AOI dropdown.
+Each registry entry must include:
+
+| key | value |
+|---|---|
+| `name` | short slug, also used as the volume subfolder and partition key |
+| `min_lon` / `min_lat` / `max_lon` / `max_lat` | bbox in EPSG:4326 |
+| `wkt` | same bbox as a WKT polygon (used for raster clipping) |
+| `flood_source` | `"melcc"` \| `"cems"` \| `"none"` (see next section) |
+| `cems_urls` | comma-separated GeoJSON URLs (only when `flood_source=cems`) |
+| `cems_year_default` | fallback year for CEMS features with no year tag |
+
+### Per-AOI parallelism
+
+`var.for_each_concurrency` (default `1`) controls how many AOIs run
+concurrently within each stage. The job cluster is reused across iterations,
+so bumping this above 1 is safe but watch driver memory on big AOIs:
+
+```bash
+databricks bundle deploy -t dev --var=for_each_concurrency=2
+```
+
+### Why partition by `aoi_name` everywhere
+
+Every bronze, silver, and gold Delta table has `aoi_name` as a partition
+column, and the notebooks set
+`spark.sql.sources.partitionOverwriteMode = "dynamic"` so a `mode("overwrite")`
+write only replaces the active AOI's partition. Without that, running the
+pipeline for AOI #2 would erase AOI #1's rows on every shared table — and the
+App's AOI dropdown would shrink back to whichever AOI ran last.
 
 ## Historical flood polygon source (`flood_source`)
 
@@ -123,17 +161,15 @@ sources, selected via the `flood_source` bundle variable:
 | `cems` | [Copernicus EMS Rapid Mapping](https://emergency.copernicus.eu/mapping/list-of-activations-rapid) GeoJSON products you point at via `cems_urls`, or any GeoJSON files dropped in `<volume>/floods/cems_input/` | Global, but only major declared events | Any non-Quebec AOI where a CEMS activation exists |
 | `none` | Writes an empty `bronze_flood_events`. The model still trains on the synthetic susceptibility label; the historical-flood overlay and live precision/recall readout disappear from the App | Any | Any AOI with no historical-flood data we trust |
 
-CEMS example — Cedar Rapids 2008 floods (activation EMSR007):
+CEMS example — adding Cedar Rapids 2008 floods (activation EMSR007) as a third
+AOI alongside the defaults:
 
 ```bash
-databricks bundle deploy -t dev \
-  --var="aoi_name=cedar_rapids" \
-  --var="aoi_bbox_min_lon=-91.80" --var="aoi_bbox_min_lat=41.90" \
-  --var="aoi_bbox_max_lon=-91.55" --var="aoi_bbox_max_lat=42.10" \
-  --var='aoi_bbox_wkt=POLYGON((-91.80 41.90, -91.55 41.90, -91.55 42.10, -91.80 42.10, -91.80 41.90))' \
-  --var="flood_source=cems" \
-  --var="cems_urls=https://emergency.copernicus.eu/.../EMSR007_AOI01_observed_event_a.geojson,https://emergency.copernicus.eu/.../EMSR007_AOI02_observed_event_a.geojson" \
-  --var="cems_year_default=2008"
+databricks bundle deploy -t dev --var='aois_json=[
+  {"name":"greater_montreal","min_lon":"-74.05","min_lat":"45.30","max_lon":"-73.30","max_lat":"45.80","wkt":"POLYGON((-74.05 45.30, -73.30 45.30, -73.30 45.80, -74.05 45.80, -74.05 45.30))","flood_source":"melcc","cems_urls":"","cems_year_default":""},
+  {"name":"manhattan","min_lon":"-74.05","min_lat":"40.68","max_lon":"-73.90","max_lat":"40.88","wkt":"POLYGON((-74.05 40.68, -73.90 40.68, -73.90 40.88, -74.05 40.88, -74.05 40.68))","flood_source":"none","cems_urls":"","cems_year_default":""},
+  {"name":"cedar_rapids","min_lon":"-91.80","min_lat":"41.90","max_lon":"-91.55","max_lat":"42.10","wkt":"POLYGON((-91.80 41.90, -91.55 41.90, -91.55 42.10, -91.80 42.10, -91.80 41.90))","flood_source":"cems","cems_urls":"https://emergency.copernicus.eu/.../EMSR007_AOI01_observed_event_a.geojson,https://emergency.copernicus.eu/.../EMSR007_AOI02_observed_event_a.geojson","cems_year_default":"2008"}
+]'
 ```
 
 If the GeoJSON URL isn't readily linkable from the activation page, just download
@@ -148,13 +184,11 @@ per-year overlay; everything else falls back to `cems_year_default`.
 > drag in a heavy GDAL/fiona dependency for marginal benefit — pick the GeoJSON
 > download from the CEMS portal instead.
 
-Skip mode for AOIs with no historical data:
+Skip mode for AOIs with no historical data: set `"flood_source": "none"` in
+that AOI's registry entry. Example:
 
-```bash
-databricks bundle deploy -t dev \
-  --var="aoi_name=miami" \
-  --var=... \
-  --var="flood_source=none"
+```json
+{"name":"miami","min_lon":"-80.40","min_lat":"25.70","max_lon":"-80.10","max_lat":"25.90","wkt":"POLYGON((-80.40 25.70, -80.10 25.70, -80.10 25.90, -80.40 25.90, -80.40 25.70))","flood_source":"none","cems_urls":"","cems_year_default":""}
 ```
 
 ## Rainfall scenarios

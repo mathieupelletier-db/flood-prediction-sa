@@ -9,8 +9,12 @@ command:
 env:
   - name: DATABRICKS_CATALOG
     value: "classic_stable_2cn624"
+  # Schema must match the bundle deploy. With DAB's `mode: development` and the
+  # default var.schema=montreal, the deployed schema name is prefixed to
+  # `dev_<user>_montreal`. If you override `--var=schema=<name>` at deploy time,
+  # update this to `dev_<user>_<name>` (or whatever the deploy target produces).
   - name: DATABRICKS_SCHEMA
-    value: "dev_mathieu_pelletier_mpelletier_flood_montreal_dev"
+    value: "dev_mathieu_pelletier_montreal"
   - name: DEFAULT_AOI
     value: "greater_montreal"
   - name: MAX_CELLS_PER_REQUEST

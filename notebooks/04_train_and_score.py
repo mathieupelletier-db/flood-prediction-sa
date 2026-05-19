@@ -25,6 +25,12 @@ scenarios = [int(s.strip()) for s in dbutils.widgets.get("scenarios_24h_mm").spl
 ns = f"{catalog}.{schema}"
 print("Scenarios (mm/24h):", scenarios)
 
+# Multi-AOI co-residence: every gold table is partitioned by aoi_name and we
+# only overwrite the active AOI's partitions. Each AOI's training run still
+# registers a new UC model version under the same name — the App scores cells
+# directly off `gold_h3_flood_predictions`, so model versioning is independent.
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
 # COMMAND ----------
 
 import mlflow
@@ -137,34 +143,48 @@ final = spark.sql("""
 """)
 
 (final.write.mode("overwrite")
-      .option("overwriteSchema", "true")
       .option("delta.columnMapping.mode", "name")
       .partitionBy("aoi_name", "scenario_24h_mm")
       .saveAsTable(f"{ns}.gold_h3_flood_predictions"))
 
-# Publish historical flood polygons + AOI metadata (same as before)
-spark.sql(f"""
-  CREATE OR REPLACE TABLE {ns}.gold_flood_events AS
+# gold_flood_events is the App's overlay source. We rewrite only the current
+# AOI's partition; other AOIs' rows survive untouched.
+fe_df = spark.sql(f"""
   SELECT aoi_name, year, geom_geojson AS geometry_geojson
   FROM {ns}.bronze_flood_events
+  WHERE aoi_name = '{aoi_name}'
 """)
-spark.sql(f"""
-  CREATE OR REPLACE TABLE {ns}.gold_aoi AS
+(fe_df.write.mode("overwrite")
+       .partitionBy("aoi_name")
+       .saveAsTable(f"{ns}.gold_flood_events"))
+
+# gold_aoi is the App's AOI-dropdown source. One row per AOI; we rewrite our
+# own row from this AOI's bronze_dem_manifest entry.
+aoi_meta_df = spark.sql(f"""
   SELECT aoi_name,
          MIN(min_lon) AS min_lon, MIN(min_lat) AS min_lat,
          MAX(max_lon) AS max_lon, MAX(max_lat) AS max_lat
   FROM {ns}.bronze_dem_manifest
+  WHERE aoi_name = '{aoi_name}'
   GROUP BY aoi_name
 """)
+(aoi_meta_df.write.mode("overwrite")
+            .partitionBy("aoi_name")
+            .saveAsTable(f"{ns}.gold_aoi"))
 
-# Scenario registry - lets the app enumerate available rainfall partitions
+# Scenario registry — lets the App enumerate available rainfall partitions per AOI.
 scen_rows = [(aoi_name, int(s)) for s in scenarios]
-spark.createDataFrame(scen_rows, ["aoi_name", "scenario_24h_mm"]) \
-     .write.mode("overwrite").option("overwriteSchema", "true") \
-     .saveAsTable(f"{ns}.gold_scenarios")
+(spark.createDataFrame(scen_rows, ["aoi_name", "scenario_24h_mm"])
+      .write.mode("overwrite")
+      .partitionBy("aoi_name")
+      .saveAsTable(f"{ns}.gold_scenarios"))
 
-print("Partitions written:", spark.sql(
-    f"SHOW PARTITIONS {ns}.gold_h3_flood_predictions").count())
+_n_partitions_for_aoi = (
+    spark.table(f"{ns}.gold_h3_flood_predictions")
+         .where(F.col("aoi_name") == aoi_name)
+         .select("scenario_24h_mm").distinct().count()
+)
+print(f"Partitions written for this AOI: {_n_partitions_for_aoi} (one per scenario)")
 
 display(spark.sql(f"""
   SELECT scenario_24h_mm,

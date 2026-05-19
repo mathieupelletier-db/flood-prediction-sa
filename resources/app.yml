@@ -2,7 +2,7 @@ resources:
   apps:
     flood_app:
       name: "flood-prediction-${bundle.target}"
-      description: "Interactive flood prediction map for ${var.aoi_name} - GeoBrix + Spatial SQL + Spark ML"
+      description: "Interactive flood prediction map - GeoBrix + Spatial SQL + Spark ML. AOIs come from var.aois_json; the App's dropdown lists every aoi_name present in gold_aoi."
       source_code_path: ../src/app
       resources:
         - name: sql_warehouse

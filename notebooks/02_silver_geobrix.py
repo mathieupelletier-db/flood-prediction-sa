@@ -37,6 +37,11 @@ h3_res = int(dbutils.widgets.get("h3_resolution"))
 ns = f"{catalog}.{schema}"
 print(f"Namespace: {ns} | AOI: {aoi_name} | H3 res: {h3_res}")
 
+# Multi-AOI co-residence: every silver/gold table is partitioned by aoi_name and
+# we use dynamic partition overwrite so a `mode("overwrite")` write only
+# replaces the active AOI's partition. See 01_ingest.py for context.
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -158,9 +163,11 @@ elev_schema = StructType([
     StructField("min_elev", DoubleType(), False),
 ])
 (spark.createDataFrame(elev_rows, elev_schema)
-      .write.mode("overwrite").option("overwriteSchema", "true")
+      .write.mode("overwrite")
+      .partitionBy("aoi_name")
       .saveAsTable(f"{ns}.silver_h3_elev"))
-print("silver_h3_elev:", spark.table(f"{ns}.silver_h3_elev").count())
+print("silver_h3_elev:", spark.table(f"{ns}.silver_h3_elev")
+      .where(F.col("aoi_name") == aoi_name).count(), "(this AOI)")
 
 # COMMAND ----------
 
@@ -175,9 +182,11 @@ print("silver_h3_elev:", spark.table(f"{ns}.silver_h3_elev").count())
 # COMMAND ----------
 
 # Use H3 built-ins available in DBR 17.1+ to find neighbours of each cell,
-# then compute max elevation difference as a proxy for slope.
-spark.sql(f"""
-  CREATE OR REPLACE TABLE {ns}.silver_h3_slope AS
+# then compute max elevation difference as a proxy for slope. We compute the
+# rows for the current AOI only and write them through the DataFrame API so
+# dynamic partition overwrite applies — `CREATE OR REPLACE TABLE` would wipe
+# every other AOI on the way through.
+slope_df = spark.sql(f"""
   WITH cells AS (
     SELECT aoi_name, h3, min_elev
     FROM {ns}.silver_h3_elev
@@ -201,7 +210,11 @@ spark.sql(f"""
   FROM pairs
   GROUP BY aoi_name, h3
 """)
-print("silver_h3_slope:", spark.table(f"{ns}.silver_h3_slope").count())
+(slope_df.write.mode("overwrite")
+        .partitionBy("aoi_name")
+        .saveAsTable(f"{ns}.silver_h3_slope"))
+print("silver_h3_slope:", spark.table(f"{ns}.silver_h3_slope")
+      .where(F.col("aoi_name") == aoi_name).count(), "(this AOI)")
 
 # COMMAND ----------
 
@@ -273,9 +286,11 @@ dist_schema = StructType([
     StructField("dist_to_water_m",  DoubleType(), False),
 ])
 (spark.createDataFrame(dist_rows, dist_schema)
-      .write.mode("overwrite").option("overwriteSchema", "true")
+      .write.mode("overwrite")
+      .partitionBy("aoi_name")
       .saveAsTable(f"{ns}.silver_h3_dist_water"))
-print("silver_h3_dist_water:", spark.table(f"{ns}.silver_h3_dist_water").count())
+print("silver_h3_dist_water:", spark.table(f"{ns}.silver_h3_dist_water")
+      .where(F.col("aoi_name") == aoi_name).count(), "(this AOI)")
 
 # COMMAND ----------
 
@@ -321,9 +336,11 @@ precip_schema = StructType([
     StructField("max5d_precip_mm",   DoubleType(), False),
 ])
 (spark.createDataFrame(precip_rows, precip_schema)
-      .write.mode("overwrite").option("overwriteSchema", "true")
+      .write.mode("overwrite")
+      .partitionBy("aoi_name")
       .saveAsTable(f"{ns}.silver_h3_precip"))
-print("silver_h3_precip:", spark.table(f"{ns}.silver_h3_precip").count())
+print("silver_h3_precip:", spark.table(f"{ns}.silver_h3_precip")
+      .where(F.col("aoi_name") == aoi_name).count(), "(this AOI)")
 
 # COMMAND ----------
 
@@ -358,9 +375,11 @@ bld_schema = StructType([
     StructField("residential_count", IntegerType(), False),
 ])
 (spark.createDataFrame(bld_rows, bld_schema)
-      .write.mode("overwrite").option("overwriteSchema", "true")
+      .write.mode("overwrite")
+      .partitionBy("aoi_name")
       .saveAsTable(f"{ns}.silver_h3_buildings"))
-print("silver_h3_buildings:", spark.table(f"{ns}.silver_h3_buildings").count())
+print("silver_h3_buildings:", spark.table(f"{ns}.silver_h3_buildings")
+      .where(F.col("aoi_name") == aoi_name).count(), "(this AOI)")
 
 # COMMAND ----------
 
@@ -395,7 +414,8 @@ for tbl in ("silver_h3_elev", "silver_h3_slope",
       ON t.h3 = s.h3 AND t.aoi_name = '{aoi_name}'
       WHEN MATCHED THEN DELETE
     """)
-    print(f"  {tbl}: {spark.table(f'{ns}.{tbl}').count()} rows")
+    n_aoi = spark.table(f"{ns}.{tbl}").where(F.col("aoi_name") == aoi_name).count()
+    print(f"  {tbl}: {n_aoi} rows (this AOI)")
 
 # COMMAND ----------
 
@@ -409,6 +429,7 @@ display(spark.sql(f"""
   LEFT JOIN {ns}.silver_h3_dist_water d USING (aoi_name, h3)
   LEFT JOIN {ns}.silver_h3_precip     p USING (aoi_name, h3)
   LEFT JOIN {ns}.silver_h3_buildings  b USING (aoi_name, h3)
+  WHERE e.aoi_name = '{aoi_name}'
   ORDER BY b.building_count DESC NULLS LAST
   LIMIT 20
 """))
