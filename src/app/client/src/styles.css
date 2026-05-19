@@ -172,6 +172,13 @@ html, body, #root { margin: 0; padding: 0; height: 100%; width: 100%; background
 .legend-years .swatch-2017 { background: rgba(229, 72, 77, 0.5); border: 1px solid rgba(229, 72, 77, 0.9); }
 .legend-years .swatch-2019 { background: rgba(255, 153, 51, 0.5); border: 1px solid rgba(255, 153, 51, 0.9); }
 
+.legend-tiers { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #21262d; color: #adb5bd; align-items: center; }
+.legend-tiers .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; border: 1px solid transparent; }
+.swatch-tier.tier-low      { background: rgba(253, 231,  37, 0.55); border-color: rgba(253, 231,  37, 1); }
+.swatch-tier.tier-moderate { background: rgba(255, 159,  64, 0.66); border-color: rgba(255, 159,  64, 1); }
+.swatch-tier.tier-high     { background: rgba(255,  99,  72, 0.78); border-color: rgba(255,  99,  72, 1); }
+.swatch-tier.tier-severe   { background: rgba(220,  20,  60, 0.9);  border-color: rgba(220,  20,  60, 1); }
+
 .tooltip {
   position: absolute;
   z-index: 2;
@@ -186,6 +193,54 @@ html, body, #root { margin: 0; padding: 0; height: 100%; width: 100%; background
   min-width: 160px;
 }
 .tooltip b { color: #fde725; }
+
+.tooltip-uw { min-width: 220px; }
+.tooltip-uw .tooltip-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  margin-bottom: 2px;
+}
+.tooltip-uw .tooltip-sub { font-weight: 400; color: #8b949e; }
+.tooltip-uw .tooltip-tier {
+  display: inline-block;
+  margin: 2px 0 6px 0;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #0d1117;
+}
+.tooltip-uw .tooltip-tier.tier-low      { background: rgba(253, 231,  37, 0.95); }
+.tooltip-uw .tooltip-tier.tier-moderate { background: rgba(255, 159,  64, 0.95); color: #0d1117; }
+.tooltip-uw .tooltip-tier.tier-high     { background: rgba(255,  99,  72, 0.95); color: #fff; }
+.tooltip-uw .tooltip-tier.tier-severe   { background: rgba(220,  20,  60, 0.95); color: #fff; }
+.tooltip-uw .tooltip-el {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid #21262d;
+  font-size: 12px;
+}
+.tooltip-uw .tooltip-el b { color: #ff8c00; }
+.tooltip-uw .tooltip-foot {
+  margin-top: 4px;
+  font-size: 10px;
+  color: #6e7681;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+
+.kpi-foot {
+  display: block !important;
+  margin-top: 4px;
+  font-size: 10px;
+  color: #6e7681;
+  font-style: italic;
+}
 
 .spinner {
   position: absolute;

@@ -36,6 +36,20 @@ SCHEMA = os.environ.get("DATABRICKS_SCHEMA", "montreal")
 DEFAULT_AOI = os.environ.get("DEFAULT_AOI", "greater_montreal")
 MAX_CELLS = int(os.environ.get("MAX_CELLS_PER_REQUEST", "50000"))
 
+# Underwriting assumptions for the /api/buildings_at_risk layer. These are
+# intentionally simple "demo-grade" defaults that an underwriter would replace
+# with their own per-policy data. Tune via env vars at deploy time.
+#   * Building replacement cost (BRC): residential = single-family-home average,
+#     other = small-commercial average for a Canadian metro market.
+#   * Loss severity (LS): % of BRC paid out at this flood depth scenario.
+#     25% is a common FEMA-derived flat assumption for inland flood at ~0.5 m
+#     depth and is what we'd use for portfolio-level expected-loss math when
+#     we don't have a depth-damage curve per building.
+RESIDENTIAL_BRC_USD = float(os.environ.get("RESIDENTIAL_BRC_USD", "300000"))
+COMMERCIAL_BRC_USD = float(os.environ.get("COMMERCIAL_BRC_USD", "1500000"))
+FLOOD_LOSS_SEVERITY = float(os.environ.get("FLOOD_LOSS_SEVERITY", "0.25"))
+MAX_BUILDINGS = int(os.environ.get("MAX_BUILDINGS_PER_REQUEST", "8000"))
+
 NS = f"`{CATALOG}`.`{SCHEMA}`"
 
 # Databricks Apps injects DATABRICKS_HOST, DATABRICKS_HTTP_PATH (warehouse) and
@@ -172,6 +186,36 @@ class Metrics(BaseModel):
     expected_buildings_at_risk: float = 0.0
     expected_residential_at_risk: float = 0.0
     high_risk_cells_with_buildings: int = 0
+
+
+class BuildingExposure(BaseModel):
+    osm_id: str
+    building_type: str | None = None
+    residential: int = 0
+    h3: str
+    flood_prob: float
+    risk_tier: str  # one of: low, moderate, high, severe
+    brc_usd: float = Field(description="Building replacement cost (USD)")
+    loss_severity: float = Field(
+        description="Damage ratio applied at this scenario depth (0..1)"
+    )
+    expected_loss_usd: float = Field(
+        description="flood_prob * brc_usd * loss_severity"
+    )
+    geometry: dict[str, Any] = Field(
+        description="GeoJSON Polygon - real footprint when available, "
+        "otherwise a small square synthesized around the centroid"
+    )
+
+
+class BuildingsAtRiskResponse(BaseModel):
+    aoi_name: str
+    scenario_24h_mm: int
+    threshold: float
+    count: int
+    total_expected_loss_usd: float
+    footprint_source: str  # "real" | "synthesized"
+    buildings: list[BuildingExposure]
 
 
 class AddressLookup(BaseModel):
@@ -374,6 +418,175 @@ def metrics(
         expected_buildings_at_risk=float(row["exp_bld"] or 0.0),
         expected_residential_at_risk=float(row["exp_res"] or 0.0),
         high_risk_cells_with_buildings=int(row["hi_bld_cells"] or 0),
+    )
+
+
+# Buildings-at-risk -----------------------------------------------------------
+
+
+@lru_cache(maxsize=4)
+def _has_footprints_table() -> bool:
+    """Check once per process whether the optional silver footprints table
+    exists. Lets us auto-upgrade from synthesized squares to real polygons
+    when the pipeline gets re-run with the polygon ingest cell enabled."""
+    try:
+        _fetch(f"SELECT 1 FROM {NS}.silver_building_footprints LIMIT 1")
+        return True
+    except Exception as e:  # noqa: BLE001 - table-not-found is the common case
+        log.info("silver_building_footprints not available (%s); using centroid fallback", e)
+        return False
+
+
+def _risk_tier(prob: float) -> str:
+    if prob >= 0.6:
+        return "severe"
+    if prob >= 0.3:
+        return "high"
+    if prob >= 0.1:
+        return "moderate"
+    return "low"
+
+
+def _synth_square(lon: float, lat: float, half_meters: float = 6.0) -> dict[str, Any]:
+    """Build a small GeoJSON Polygon (~12 m square) around a centroid.
+
+    Used as a visual stand-in when only the centroid is available in
+    bronze_buildings. ~12 m matches typical Montreal residential footprints
+    and reads as an individual building at city-block zoom levels.
+
+    Latitude degree is ~111,320 m; longitude degree shrinks by cos(lat).
+    """
+    import math
+
+    dlat = half_meters / 111_320.0
+    dlon = half_meters / (111_320.0 * max(math.cos(math.radians(lat)), 1e-6))
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [lon - dlon, lat - dlat],
+            [lon + dlon, lat - dlat],
+            [lon + dlon, lat + dlat],
+            [lon - dlon, lat + dlat],
+            [lon - dlon, lat - dlat],
+        ]],
+    }
+
+
+@app.get("/api/buildings_at_risk", response_model=BuildingsAtRiskResponse)
+def buildings_at_risk(
+    aoi: str = Query(default=DEFAULT_AOI),
+    scenario_mm: int = Query(default=60, ge=0, le=500),
+    threshold: float = Query(
+        default=0.3, ge=0.0, le=1.0,
+        description="Only return buildings whose enclosing H3 cell has flood_prob >= threshold",
+    ),
+    min_lon: float | None = None,
+    min_lat: float | None = None,
+    max_lon: float | None = None,
+    max_lat: float | None = None,
+    limit: int = Query(default=MAX_BUILDINGS, le=MAX_BUILDINGS),
+) -> BuildingsAtRiskResponse:
+    """Return building-level flood exposure for the underwriter overlay.
+
+    Each row is the building joined to its H3 cell's flood probability for
+    the requested scenario, plus a simple loss model:
+
+        expected_loss = flood_prob * BRC * loss_severity
+
+    where BRC is residential vs commercial replacement cost and loss
+    severity is a flat 25% (FEMA-style demo assumption). Real underwriting
+    would substitute per-policy insured values and a depth-damage curve.
+    """
+    scenario = _nearest_scenario(aoi, scenario_mm)
+    use_real = _has_footprints_table()
+
+    bbox_clause = ""
+    bbox_params: list[Any] = []
+    if None not in (min_lon, min_lat, max_lon, max_lat):
+        bbox_clause = " AND b.lon BETWEEN ? AND ? AND b.lat BETWEEN ? AND ?"
+        bbox_params = [min_lon, max_lon, min_lat, max_lat]
+
+    if use_real:
+        # Real polygons live in silver_building_footprints alongside the
+        # centroid (lon/lat) so the same bbox filter still works.
+        q = f"""
+            SELECT b.osm_id, b.building AS building_type, b.residential,
+                   b.lon, b.lat, b.geometry_geojson,
+                   p.h3, p.flood_prob
+            FROM {NS}.silver_building_footprints b
+            JOIN {NS}.gold_h3_flood_predictions p
+              ON p.aoi_name = b.aoi_name AND p.h3 = b.h3
+            WHERE b.aoi_name = ? AND p.scenario_24h_mm = ?
+              AND p.flood_prob >= ?{bbox_clause}
+            ORDER BY p.flood_prob DESC
+            LIMIT {int(limit)}
+        """
+    else:
+        # Fallback: synthesize tiny squares around each centroid in
+        # bronze_buildings, join to predictions via the centroid's H3 cell.
+        # The h3_longlat_ash3 SQL function ships with Databricks Runtime
+        # (h3-spark). Resolution 9 matches the pipeline's feature grid.
+        q = f"""
+            WITH bld AS (
+              SELECT b.osm_id, b.building AS building_type, b.residential,
+                     b.lon, b.lat,
+                     h3_longlatash3(b.lon, b.lat, 9) AS h3
+              FROM {NS}.bronze_buildings b
+              WHERE b.aoi_name = ?{bbox_clause}
+            )
+            SELECT bld.osm_id, bld.building_type, bld.residential,
+                   bld.lon, bld.lat,
+                   CAST(NULL AS STRING) AS geometry_geojson,
+                   bld.h3, p.flood_prob
+            FROM bld
+            JOIN {NS}.gold_h3_flood_predictions p
+              ON p.aoi_name = ? AND p.h3 = bld.h3
+            WHERE p.scenario_24h_mm = ? AND p.flood_prob >= ?
+            ORDER BY p.flood_prob DESC
+            LIMIT {int(limit)}
+        """
+
+    if use_real:
+        params: tuple = (aoi, scenario, threshold, *bbox_params)
+    else:
+        params = (aoi, *bbox_params, aoi, scenario, threshold)
+
+    rows = _fetch(q, params)
+    total_el = 0.0
+    buildings: list[BuildingExposure] = []
+    for r in rows:
+        prob = float(r["flood_prob"] or 0.0)
+        is_res = bool(int(r.get("residential") or 0))
+        brc = RESIDENTIAL_BRC_USD if is_res else COMMERCIAL_BRC_USD
+        el = prob * brc * FLOOD_LOSS_SEVERITY
+        total_el += el
+
+        if r.get("geometry_geojson"):
+            geom = json.loads(r["geometry_geojson"])
+        else:
+            geom = _synth_square(float(r["lon"]), float(r["lat"]))
+
+        buildings.append(BuildingExposure(
+            osm_id=str(r.get("osm_id") or ""),
+            building_type=r.get("building_type") or None,
+            residential=1 if is_res else 0,
+            h3=_h3_hex(r["h3"]),
+            flood_prob=prob,
+            risk_tier=_risk_tier(prob),
+            brc_usd=brc,
+            loss_severity=FLOOD_LOSS_SEVERITY,
+            expected_loss_usd=el,
+            geometry=geom,
+        ))
+
+    return BuildingsAtRiskResponse(
+        aoi_name=aoi,
+        scenario_24h_mm=scenario,
+        threshold=threshold,
+        count=len(buildings),
+        total_expected_loss_usd=total_el,
+        footprint_source="real" if use_real else "synthesized",
+        buildings=buildings,
     )
 
 

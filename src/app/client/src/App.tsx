@@ -2,7 +2,34 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PickingInfo } from "@deck.gl/core";
 import { FloodMap, THEMES, type ViewState, type MapTheme } from "./FloodMap";
 import { AddressCard } from "./AddressCard";
-import { api, type AOI, type AddressLookup, type PredictionCell, type FloodEvent, type Metrics } from "./api";
+import {
+  api,
+  type AOI,
+  type AddressLookup,
+  type PredictionCell,
+  type FloodEvent,
+  type Metrics,
+  type BuildingExposure,
+} from "./api";
+
+const RISK_TIER_LABEL: Record<string, string> = {
+  low: "Low",
+  moderate: "Moderate",
+  high: "High",
+  severe: "Severe",
+};
+
+function fmtUsd(n: number): string {
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000)     return `$${(n / 1_000).toFixed(1)}K`;
+  return `$${Math.round(n)}`;
+}
+
+function isBuildingExposure(o: unknown): o is BuildingExposure {
+  return !!o && typeof o === "object"
+    && "expected_loss_usd" in (o as Record<string, unknown>)
+    && "risk_tier" in (o as Record<string, unknown>);
+}
 
 const DEFAULT_VIEW: ViewState = {
   longitude: -73.65,
@@ -46,6 +73,11 @@ export default function App() {
   const [view, setView] = useState<ViewState>(DEFAULT_VIEW);
   const [hover, setHover] = useState<PickingInfo | null>(null);
   const [addressHit, setAddressHit] = useState<AddressLookup | null>(null);
+  const [showBuildings, setShowBuildings] = useState(false);
+  const [buildings, setBuildings] = useState<BuildingExposure[]>([]);
+  const [buildingsLoading, setBuildingsLoading] = useState(false);
+  const [buildingsTotalEl, setBuildingsTotalEl] = useState(0);
+  const [footprintSource, setFootprintSource] = useState<"real" | "synthesized">("synthesized");
 
   const onAddressResult = useCallback((hit: AddressLookup | null) => {
     setAddressHit(hit);
@@ -151,6 +183,64 @@ export default function App() {
     };
   }, [aoi, showFloods]);
 
+  // Approximate the current map viewport as a lon/lat bbox so the buildings
+  // endpoint only ships footprints the user is actually looking at. This is
+  // intentionally crude (Web-Mercator-flat, no rotation/pitch correction) -
+  // we pad by 25% so panning a little doesn't immediately refetch, and we
+  // round to the nearest snap value so tiny zoom drifts don't churn the API.
+  const viewportBbox = useMemo(() => {
+    const z = view.zoom;
+    const halfLatDeg = 180 / Math.pow(2, z) * 0.6;
+    const halfLonDeg = halfLatDeg / Math.max(Math.cos(view.latitude * Math.PI / 180), 0.1);
+    const pad = 1.25;
+    return {
+      minLon: view.longitude - halfLonDeg * pad,
+      maxLon: view.longitude + halfLonDeg * pad,
+      minLat: view.latitude  - halfLatDeg * pad,
+      maxLat: view.latitude  + halfLatDeg * pad,
+    };
+  }, [view.longitude, view.latitude, view.zoom]);
+
+  // Debounce + lazy-fetch the buildings layer. Only runs when the toggle is
+  // on; refetches when AOI / scenario / threshold / viewport change.
+  useEffect(() => {
+    if (!showBuildings || !scenarios.length) {
+      setBuildingsLoading(false);
+      return;
+    }
+    const snapped = snap(scenarioMm, scenarios);
+    // Underwriter overlay only cares about cells with real risk - clamp the
+    // floor so the layer doesn't paint 100% of buildings when the user drags
+    // the prob slider to 0.
+    const bldThreshold = Math.max(0.2, threshold);
+    let cancelled = false;
+    setBuildingsLoading(true);
+    const handle = window.setTimeout(() => {
+      api.buildingsAtRisk(aoi, snapped, bldThreshold, viewportBbox)
+        .then((r) => {
+          if (cancelled) return;
+          setBuildings(r.buildings);
+          setBuildingsTotalEl(r.total_expected_loss_usd);
+          setFootprintSource(r.footprint_source);
+        })
+        .catch((err) => console.error(err))
+        .finally(() => !cancelled && setBuildingsLoading(false));
+    }, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [showBuildings, aoi, scenarioMm, threshold, scenarios, viewportBbox]);
+
+  // Drop stale buildings when the layer is toggled off so the next enable
+  // doesn't flash old polygons before the new fetch lands.
+  useEffect(() => {
+    if (!showBuildings) {
+      setBuildings([]);
+      setBuildingsTotalEl(0);
+    }
+  }, [showBuildings]);
+
   const onHover = useCallback((info: PickingInfo) => setHover(info), []);
 
   const snappedScenario = useMemo(
@@ -160,6 +250,34 @@ export default function App() {
 
   const tooltip = useMemo(() => {
     if (!hover || !hover.object) return null;
+
+    // GeoJsonLayer wraps the building in a Feature, so unwrap properties.
+    const obj = hover.object as { properties?: unknown } | BuildingExposure | PredictionCell;
+    const maybeBuilding = "properties" in obj ? obj.properties : obj;
+    if (isBuildingExposure(maybeBuilding)) {
+      const b = maybeBuilding;
+      return (
+        <div className="tooltip tooltip-uw" style={{ left: hover.x + 12, top: hover.y + 12 }}>
+          <div className="tooltip-title">
+            {b.residential ? "Residential" : "Commercial / other"}
+            {b.building_type && b.building_type !== "yes" && (
+              <span className="tooltip-sub"> · {b.building_type}</span>
+            )}
+          </div>
+          <div className={`tooltip-tier tier-${b.risk_tier}`}>
+            {RISK_TIER_LABEL[b.risk_tier]} risk
+          </div>
+          <div>Flood prob: <b>{(b.flood_prob * 100).toFixed(1)}%</b></div>
+          <div>Replacement cost: <b>{fmtUsd(b.brc_usd)}</b></div>
+          <div>Loss severity: <b>{(b.loss_severity * 100).toFixed(0)}%</b></div>
+          <div className="tooltip-el">
+            Expected loss: <b>{fmtUsd(b.expected_loss_usd)}</b>
+          </div>
+          <div className="tooltip-foot">H3 {b.h3} · {b.osm_id}</div>
+        </div>
+      );
+    }
+
     const d = hover.object as PredictionCell;
     return (
       <div className="tooltip" style={{ left: hover.x + 12, top: hover.y + 12 }}>
@@ -202,6 +320,8 @@ export default function App() {
           cells={cells}
           events={events}
           showRealFloods={showFloods}
+          buildings={buildings}
+          showBuildings={showBuildings}
           theme={theme}
           pin={addressHit ? { lat: addressHit.lat, lon: addressHit.lon, prob: addressHit.flood_prob } : null}
           onHover={onHover}
@@ -282,6 +402,16 @@ export default function App() {
           {overlayLoading && <span className="toggle-loading">loading…</span>}
         </label>
 
+        <label className="toggle">
+          <input
+            type="checkbox"
+            checked={showBuildings}
+            onChange={(e) => setShowBuildings(e.target.checked)}
+          />
+          Building exposure (underwriting)
+          {buildingsLoading && <span className="toggle-loading">loading…</span>}
+        </label>
+
         <div className="metrics">
           <div className="kpi">
             <span>Scenario</span>
@@ -337,6 +467,22 @@ export default function App() {
               </div>
             </>
           )}
+          {showBuildings && (
+            <>
+              <div className="kpi kpi-section">Underwriting (visible)</div>
+              <div className="kpi">
+                <span>Buildings rendered</span>
+                <span className="v">{buildings.length.toLocaleString()}</span>
+              </div>
+              <div className="kpi">
+                <span>Aggregate expected loss</span>
+                <span className="v">{fmtUsd(buildingsTotalEl)}</span>
+              </div>
+              <div className="kpi kpi-foot">
+                Footprints: {footprintSource === "real" ? "real (silver_building_footprints)" : "synthesized from centroids"}
+              </div>
+            </>
+          )}
         </div>
       </aside>
 
@@ -348,6 +494,14 @@ export default function App() {
           <div className="legend-years">
             <span className="swatch swatch-2017" /> 2017 flood
             <span className="swatch swatch-2019" /> 2019 flood
+          </div>
+        )}
+        {showBuildings && (
+          <div className="legend-tiers">
+            <span className="swatch swatch-tier tier-low" /> low
+            <span className="swatch swatch-tier tier-moderate" /> moderate
+            <span className="swatch swatch-tier tier-high" /> high
+            <span className="swatch swatch-tier tier-severe" /> severe
           </div>
         )}
       </div>

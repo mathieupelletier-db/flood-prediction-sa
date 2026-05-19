@@ -45,6 +45,31 @@ export type Metrics = {
   high_risk_cells_with_buildings: number;
 };
 
+export type RiskTier = "low" | "moderate" | "high" | "severe";
+
+export type BuildingExposure = {
+  osm_id: string;
+  building_type: string | null;
+  residential: number;
+  h3: string;
+  flood_prob: number;
+  risk_tier: RiskTier;
+  brc_usd: number;
+  loss_severity: number;
+  expected_loss_usd: number;
+  geometry: GeoJSON.Polygon | Record<string, unknown>;
+};
+
+export type BuildingsAtRiskResponse = {
+  aoi_name: string;
+  scenario_24h_mm: number;
+  threshold: number;
+  count: number;
+  total_expected_loss_usd: number;
+  footprint_source: "real" | "synthesized";
+  buildings: BuildingExposure[];
+};
+
 export type AddressLookup = {
   query: string;
   resolved_name: string;
@@ -90,6 +115,27 @@ export const api = {
     fetchJson<Metrics>(
       `/api/metrics?aoi=${encodeURIComponent(aoi)}&scenario_mm=${scenarioMm}&threshold=${threshold}`,
     ),
+  buildingsAtRisk: (
+    aoi: string,
+    scenarioMm: number,
+    threshold: number,
+    bbox?: { minLon: number; minLat: number; maxLon: number; maxLat: number },
+    limit = 4000,
+  ) => {
+    const qs = new URLSearchParams({
+      aoi,
+      scenario_mm: String(scenarioMm),
+      threshold: String(threshold),
+      limit: String(limit),
+    });
+    if (bbox) {
+      qs.set("min_lon", String(bbox.minLon));
+      qs.set("min_lat", String(bbox.minLat));
+      qs.set("max_lon", String(bbox.maxLon));
+      qs.set("max_lat", String(bbox.maxLat));
+    }
+    return fetchJson<BuildingsAtRiskResponse>(`/api/buildings_at_risk?${qs}`);
+  },
   lookup: (aoi: string, scenarioMm: number, query: string) =>
     fetchJson<AddressLookup>(
       `/api/lookup?aoi=${encodeURIComponent(aoi)}&scenario_mm=${scenarioMm}` +

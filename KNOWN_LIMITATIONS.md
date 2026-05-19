@@ -56,6 +56,45 @@ surfaces.
 - Implement the proper fix described above; the work is contained to
   `01_ingest.py` and the silver "drop in-water cells" section.
 
+### Building footprints are synthesized from centroids
+
+**Symptom.** The `/api/buildings_at_risk` endpoint and the "Building exposure
+(underwriting)" map layer in the app render every building as a small ~12 m
+square around its OSM centroid, not as the building's real footprint
+polygon. At city-block zoom this reads as individual buildings, but it is not
+geometrically accurate, and very large structures (industrial, multi-block
+mall) are drawn the same size as a single-family home.
+
+**Root cause.** `notebooks/01_ingest.py` queries Overpass with
+`out center tags`, which ships only the centroid + tags for each building
+way/relation (~30 MB for Greater Montreal, ~300k features). Pulling the full
+polygon geometry with `out geom` is closer to ~300+ MB and triggers Overpass
+rate-limit / timeout for the default AOI on the free tier. The app therefore
+joins `bronze_buildings` (point) to `gold_h3_flood_predictions` by H3 cell
+and synthesizes a square around each centroid at request time.
+
+**Why we are leaving it.** Building-level footprints don't change the
+exposure math (`expected_loss = flood_prob * BRC * loss_severity`) — that's
+already accurate because it keys off the cell-level `flood_prob` and a
+per-building `residential` flag from OSM tags. The polygon shape is purely
+a visual upgrade.
+
+**Path to real polygons.** The app endpoint already auto-upgrades when a
+`silver_building_footprints` table exists in the schema. To produce it:
+
+1. In `notebooks/01_ingest.py`, replace `out center tags` with
+   `out geom tags` for the buildings Overpass query, page the response by
+   sub-bbox if Overpass times out, and write a new `bronze_building_footprints`
+   table with `(aoi_name, osm_id, building, residential, lon, lat,
+   geometry_geojson)`.
+2. In `notebooks/02_silver_geobrix.py`, add a step that reads
+   `bronze_building_footprints`, computes the H3 cell of each centroid with
+   `h3.latlng_to_cell(lat, lon, h3_res)`, and writes
+   `silver_building_footprints` with the same columns plus `h3`.
+3. Redeploy the app. The `_has_footprints_table()` lru_cache picks the new
+   table up on next process start and switches `footprint_source` from
+   `"synthesized"` to `"real"` in the response.
+
 ### Hybrid labels mix synthetic and real
 
 The model trains on a rainfall-aware **synthetic susceptibility label**, with

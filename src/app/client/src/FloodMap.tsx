@@ -4,8 +4,24 @@ import { H3HexagonLayer } from "@deck.gl/geo-layers";
 import { GeoJsonLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { Map as MapLibre } from "react-map-gl/maplibre";
 import type { PickingInfo } from "@deck.gl/core";
-import type { PredictionCell, FloodEvent } from "./api";
+import type { PredictionCell, FloodEvent, BuildingExposure, RiskTier } from "./api";
 import { viridis } from "./colors";
+
+// Underwriter-facing risk-tier palette. Higher risk = warmer, more opaque.
+// Tuned to read on top of the viridis hex layer without colliding with the
+// historical-flood red/amber polygons.
+const RISK_FILL: Record<RiskTier, [number, number, number, number]> = {
+  low:      [253, 231,  37, 140],
+  moderate: [255, 159,  64, 170],
+  high:     [255,  99,  72, 200],
+  severe:   [220,  20,  60, 230],
+};
+const RISK_LINE: Record<RiskTier, [number, number, number, number]> = {
+  low:      [253, 231,  37, 255],
+  moderate: [255, 159,  64, 255],
+  high:     [255,  99,  72, 255],
+  severe:   [220,  20,  60, 255],
+};
 
 export type ViewState = {
   longitude: number;
@@ -29,6 +45,8 @@ type Props = {
   cells: PredictionCell[];
   events: FloodEvent[];
   showRealFloods: boolean;
+  buildings: BuildingExposure[];
+  showBuildings: boolean;
   theme: MapTheme;
   pin?: { lat: number; lon: number; prob: number } | null;
   onHover?: (info: PickingInfo) => void;
@@ -40,6 +58,8 @@ export function FloodMap({
   cells,
   events,
   showRealFloods,
+  buildings,
+  showBuildings,
   theme,
   pin,
   onHover,
@@ -106,6 +126,38 @@ export function FloodMap({
     );
   }, [events, showRealFloods]);
 
+  // Building polygons - one GeoJsonLayer carrying every visible exposure.
+  // Drawn above the historical-flood overlay (depthTest off so it never
+  // disappears behind the extruded hex layer) and pickable so the underwriter
+  // tooltip can render BRC / expected-loss for each footprint.
+  const buildingsLayer = useMemo(() => {
+    if (!showBuildings || buildings.length === 0) return null;
+    return new GeoJsonLayer({
+      id: "buildings-at-risk",
+      data: {
+        type: "FeatureCollection",
+        features: buildings.map((b) => ({
+          type: "Feature",
+          properties: b,
+          geometry: b.geometry as GeoJSON.Polygon,
+        })),
+      },
+      pickable: true,
+      stroked: true,
+      filled: true,
+      lineWidthMinPixels: 0.5,
+      getFillColor: (f) =>
+        RISK_FILL[(f.properties as BuildingExposure).risk_tier],
+      getLineColor: (f) =>
+        RISK_LINE[(f.properties as BuildingExposure).risk_tier],
+      parameters: { depthTest: false },
+      updateTriggers: {
+        getFillColor: buildings.length,
+        getLineColor: buildings.length,
+      },
+    });
+  }, [buildings, showBuildings]);
+
   const pinLayer = useMemo(() => {
     if (!pin) return null;
     const [r, g, b] = viridis(pin.prob);
@@ -128,7 +180,12 @@ export function FloodMap({
     <DeckGL
       viewState={viewState}
       controller
-      layers={[hexLayer, ...floodLayers, ...(pinLayer ? [pinLayer] : [])]}
+      layers={[
+        hexLayer,
+        ...floodLayers,
+        ...(buildingsLayer ? [buildingsLayer] : []),
+        ...(pinLayer ? [pinLayer] : []),
+      ]}
       onViewStateChange={(e) => onViewStateChange(e.viewState as ViewState)}
       onHover={onHover}
     >
