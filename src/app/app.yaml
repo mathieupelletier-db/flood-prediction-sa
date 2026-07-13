@@ -26,3 +26,9 @@ env:
     value: "adb-7405612117836809.9.azuredatabricks.net"
   - name: DATABRICKS_HTTP_PATH
     value: "/sql/1.0/warehouses/e921c86338f3e272"
+  # Underwriter chat (Genie Space). Provisioned by scripts/genie_bootstrap.py.
+  # Databricks Apps deploys this file verbatim (no `${var.X}` substitution),
+  # so the space id is hardcoded - same pattern as DATABRICKS_HOST/HTTP_PATH
+  # above. Set to "" to hide the chat panel.
+  - name: DATABRICKS_GENIE_SPACE_ID
+    value: "01f153a756791677b216b0ad29cafef1"

@@ -64,6 +64,20 @@ variables:
     lookup:
       warehouse: "Shared Unity Catalog Serverless"
 
+  genie_space_id:
+    description: |-
+      Id of the Genie Space backing the underwriter chat panel. Created
+      out-of-band by `scripts/genie_bootstrap.py` (DABs has no managed
+      `genie_space` resource type yet). Leave empty to deploy the app
+      without chat; the panel will hide itself. Bootstrap workflow:
+
+          GENIE_SPACE_ID=$(python scripts/genie_bootstrap.py \
+              --profile <p> --catalog <c> --schema <s> \
+              --warehouse-id ${var.warehouse_id} \
+              --grant-sp <app-sp-application-id>)
+          databricks bundle deploy -t dev --var=genie_space_id=$GENIE_SPACE_ID
+    default: ""
+
   model_name:
     description: "3-part UC model name"
     default: "flood_demo.montreal.flood_rf"

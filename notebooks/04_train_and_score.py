@@ -197,3 +197,168 @@ display(spark.sql(f"""
   GROUP BY scenario_24h_mm
   ORDER BY scenario_24h_mm
 """))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Underwriting tables (chatbot surface)
+# MAGIC
+# MAGIC Two tables that turn the cell-level predictions into a building-level
+# MAGIC view that the Genie Space chatbot can talk to:
+# MAGIC
+# MAGIC * `gold_underwriting_assumptions` - two-row reference table holding the
+# MAGIC   demo-grade BRC + loss-severity constants per building class. Created
+# MAGIC   with `IF NOT EXISTS` so an SA can edit the numbers in-place via SQL
+# MAGIC   without the pipeline blowing them away on next deploy.
+# MAGIC * `gold_building_exposure` - one row per (aoi, scenario, building),
+# MAGIC   joining `bronze_buildings` centroids to `gold_h3_flood_predictions`
+# MAGIC   by H3 and to the assumptions table by class. Includes pre-computed
+# MAGIC   `risk_tier`, `expected_loss_usd`, and `inside_historical_flood`
+# MAGIC   (the cell's 2017/2019 label) so Genie answers stay single-SELECT.
+
+# COMMAND ----------
+
+# Reference table for replacement-cost + loss-severity assumptions. Demo-grade
+# defaults; an SA can `UPDATE gold_underwriting_assumptions SET brc_usd = ...`
+# in the workspace and the next pipeline run will preserve the edit because of
+# IF NOT EXISTS.
+spark.sql(f"""
+  CREATE TABLE IF NOT EXISTS {ns}.gold_underwriting_assumptions (
+    aoi_name       STRING,
+    building_class STRING,
+    brc_usd        DOUBLE,
+    loss_severity  DOUBLE,
+    notes          STRING
+  ) USING DELTA
+""")
+_asm_count = spark.table(f"{ns}.gold_underwriting_assumptions").count()
+if _asm_count == 0:
+    spark.createDataFrame(
+        [
+            ("*", "residential", 300000.0, 0.25,
+             "Demo default. Replace with the carrier's policy book or "
+             "CoreLogic/Verisk replacement-cost estimator."),
+            ("*", "commercial",  1500000.0, 0.25,
+             "Demo default. Same source caveat as residential. Loss "
+             "severity is a flat FEMA-style assumption; production would "
+             "use a depth-damage curve."),
+        ],
+        ["aoi_name", "building_class", "brc_usd", "loss_severity", "notes"],
+    ).write.mode("append").saveAsTable(f"{ns}.gold_underwriting_assumptions")
+print("gold_underwriting_assumptions rows:",
+      spark.table(f"{ns}.gold_underwriting_assumptions").count())
+
+# COMMAND ----------
+
+# Building-level exposure. One row per (aoi, scenario, building). We compute
+# rows for the current AOI only and write through the DataFrame API so dynamic
+# partition overwrite leaves other AOIs untouched. Joining the assumptions
+# table (rather than hardcoding the constants) lets the SA edit BRC/severity
+# without changing pipeline code.
+exposure_df = spark.sql(f"""
+  WITH bld AS (
+    SELECT
+      b.aoi_name,
+      b.osm_id,
+      COALESCE(NULLIF(b.building, ''), 'unknown') AS building_type,
+      b.residential,
+      b.lon, b.lat,
+      h3_longlatash3(b.lon, b.lat, {h3_res}) AS h3
+    FROM {ns}.bronze_buildings b
+    WHERE b.aoi_name = '{aoi_name}'
+  ),
+  asm AS (
+    SELECT building_class, brc_usd, loss_severity
+    FROM {ns}.gold_underwriting_assumptions
+    WHERE aoi_name = '*'
+  )
+  SELECT
+    p.aoi_name,
+    p.scenario_24h_mm,
+    bld.osm_id,
+    bld.building_type,
+    bld.residential,
+    bld.h3,
+    bld.lon,
+    bld.lat,
+    p.flood_prob,
+    CASE
+      WHEN p.flood_prob >= 0.6 THEN 'severe'
+      WHEN p.flood_prob >= 0.3 THEN 'high'
+      WHEN p.flood_prob >= 0.1 THEN 'moderate'
+      ELSE 'low'
+    END AS risk_tier,
+    asm.brc_usd,
+    asm.loss_severity,
+    CAST(p.flood_prob * asm.brc_usd * asm.loss_severity AS DOUBLE) AS expected_loss_usd,
+    p.min_elev,
+    p.slope_deg,
+    p.dist_to_water_m,
+    p.label_real AS inside_historical_flood
+  FROM bld
+  JOIN {ns}.gold_h3_flood_predictions p
+    ON p.aoi_name = bld.aoi_name AND p.h3 = bld.h3
+  JOIN asm
+    ON asm.building_class =
+       CASE WHEN bld.residential = 1 THEN 'residential' ELSE 'commercial' END
+""")
+
+(exposure_df.write.mode("overwrite")
+            .option("delta.columnMapping.mode", "name")
+            .partitionBy("aoi_name", "scenario_24h_mm")
+            .saveAsTable(f"{ns}.gold_building_exposure"))
+
+_exposure_rows = (
+    spark.table(f"{ns}.gold_building_exposure")
+         .where(F.col("aoi_name") == aoi_name)
+         .count()
+)
+print(f"gold_building_exposure rows for {aoi_name}: {_exposure_rows:,}")
+
+# Genie-facing column comments. Genie's auto-generated table summary uses these
+# verbatim, so spelling them out here is the single highest-leverage thing we
+# can do to improve NL->SQL accuracy without touching the space instructions.
+for col, comment in [
+    ("aoi_name",                "Area of interest slug, e.g. 'greater_montreal' or 'manhattan'. Partition key."),
+    ("scenario_24h_mm",         "24-hour rainfall scenario in millimetres. Partition key. Discrete values: 10, 30, 60, 100, 150, 200."),
+    ("osm_id",                  "OpenStreetMap feature id of the building, e.g. 'way/123456'. Primary id within an (aoi, scenario)."),
+    ("building_type",           "OSM building tag value, e.g. 'detached', 'apartments', 'commercial', 'industrial', 'yes', 'unknown'."),
+    ("residential",             "1 if the OSM building tag is in the residential allowlist (house, apartments, detached, etc.), 0 otherwise."),
+    ("h3",                      "H3 cell id at resolution 9 (~174 m edge) covering the building centroid. BIGINT."),
+    ("lon",                     "Building centroid longitude in EPSG:4326."),
+    ("lat",                     "Building centroid latitude in EPSG:4326."),
+    ("flood_prob",              "Model-predicted flood probability for this building's H3 cell at this rainfall scenario. 0..1."),
+    ("risk_tier",               "Discrete risk band: 'low' (<0.1), 'moderate' (0.1-0.3), 'high' (0.3-0.6), 'severe' (>=0.6)."),
+    ("brc_usd",                 "Building replacement cost in USD. Demo constants from gold_underwriting_assumptions."),
+    ("loss_severity",           "Fraction of BRC paid out at this flood depth. Flat 0.25 demo assumption."),
+    ("expected_loss_usd",       "flood_prob * brc_usd * loss_severity. The underwriter's primary exposure metric."),
+    ("min_elev",                "Cell-level minimum elevation in metres. Joined from gold_h3_flood_predictions for explainability."),
+    ("slope_deg",               "Cell-level slope in degrees."),
+    ("dist_to_water_m",         "Cell centroid distance to nearest OSM water feature, in metres."),
+    ("inside_historical_flood", "1 if this building's H3 cell intersects a 2017 or 2019 historical flood polygon, 0 otherwise."),
+]:
+    spark.sql(
+        f"ALTER TABLE {ns}.gold_building_exposure ALTER COLUMN {col} "
+        f"COMMENT '{comment.replace(chr(39), chr(39) * 2)}'"
+    )
+
+spark.sql(
+    f"COMMENT ON TABLE {ns}.gold_building_exposure IS "
+    f"'One row per (aoi, scenario, building). Joins OSM building centroids "
+    f"to the H3 flood-prediction grid and to underwriting assumptions to "
+    f"produce a single-SELECT-friendly view of building-level expected loss. "
+    f"This is the Genie Space `flood_underwriter` data surface.'"
+)
+
+# COMMAND ----------
+
+display(spark.sql(f"""
+  SELECT scenario_24h_mm, risk_tier,
+         COUNT(*)                                AS buildings,
+         SUM(CASE WHEN residential = 1 THEN 1 ELSE 0 END) AS residential,
+         ROUND(SUM(expected_loss_usd), 0)        AS total_expected_loss_usd
+  FROM {ns}.gold_building_exposure
+  WHERE aoi_name = '{aoi_name}'
+  GROUP BY scenario_24h_mm, risk_tier
+  ORDER BY scenario_24h_mm, risk_tier
+"""))

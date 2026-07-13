@@ -286,6 +286,79 @@ cd src/app/client
 npm run dev           # or: bun run dev
 ```
 
+## Underwriter Q&A (Genie chatbot)
+
+The app's side panel ships an optional chat experience for insurance
+underwriters and portfolio analysts. It is backed by a **Databricks Genie
+Space** that translates natural-language questions into SQL on a building-level
+gold table (`gold_building_exposure`). The chatbot can answer aggregate,
+slicing, top-N, and scenario-stress questions; it does **not** answer "how does
+the model work" or trigger map actions (see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)).
+
+### What it can answer
+
+```text
+"What is total expected loss in Greater Montreal at the 100 mm scenario?"
+"Top 20 buildings by expected loss in Greater Montreal at 150 mm"
+"Residential vs commercial expected loss breakdown at 100 mm"
+"How many buildings are in each risk tier in Greater Montreal at 100 mm?"
+"Compare aggregate expected loss at 60, 100, and 150 mm in Greater Montreal"
+"Which H3 cells carry the most expected loss at 100 mm?"
+"How many severe-risk buildings sit inside the 2017 flood polygon?"
+"How many buildings exceed $50K expected loss at 100 mm in Greater Montreal?"
+```
+
+Each user message is silently prefixed on the server with the current map
+context ("AOI=greater_montreal; scenario=100 mm/24h") so questions like "total
+EL at this scenario" work without typing the values.
+
+### Data surface
+
+The space sees exactly four tables under `${var.catalog}.${schema}`:
+
+| Table                              | Granularity                            | Used for                                |
+| ---------------------------------- | -------------------------------------- | --------------------------------------- |
+| `gold_building_exposure`           | (aoi, scenario, building)              | Every underwriter question              |
+| `gold_underwriting_assumptions`    | (building_class)                       | Replacement cost + loss-severity config |
+| `gold_flood_events`                | (aoi, year, polygon)                   | Historical validation questions         |
+| `gold_scenarios` + `gold_aoi`      | (aoi[, scenario])                      | Dimension lookups                       |
+
+`gold_building_exposure` is the single biggest accuracy lever - it's
+pre-denormalized so 90% of underwriter questions are single SELECTs. Schema:
+`aoi_name, scenario_24h_mm, osm_id, building_type, residential, h3, lon, lat,
+flood_prob, risk_tier, brc_usd, loss_severity, expected_loss_usd, min_elev,
+slope_deg, dist_to_water_m, inside_historical_flood`. Every column carries a
+COMMENT (set in `04_train_and_score.py`) so Genie's auto-generated table
+summary lands accurately without any space-side hand-holding.
+
+### Provision the space
+
+DABs has no managed `genie_space` resource type yet, so the space is created
+out-of-band with a one-line script:
+
+```bash
+GENIE_SPACE_ID=$(python scripts/genie_bootstrap.py \
+    --profile      adb-7405612117836809 \
+    --catalog      classic_stable_2cn624 \
+    --schema       dev_mathieu_pelletier_montreal \
+    --warehouse-id e921c86338f3e272 \
+    --grant-sp     <app-service-principal-application-id>)
+
+databricks bundle deploy -t dev --var=genie_space_id=$GENIE_SPACE_ID
+```
+
+The script is idempotent (re-running updates the existing space rather than
+creating a duplicate), reads the full space definition from
+[resources/genie/flood_underwriter.json](resources/genie/flood_underwriter.json)
+(instructions, 8 certified questions with canonical SQL, sample questions),
+substitutes `{catalog}`/`{schema}`, optionally grants the app SP CAN_QUERY on
+the space, and prints the resulting `space_id` so the deploy can rewire the
+app's `DATABRICKS_GENIE_SPACE_ID` env var.
+
+If `genie_space_id` is empty (the default), the chat panel hides itself - the
+rest of the app continues to work normally. This makes the chatbot a clean
+opt-in for environments where Genie isn't enabled.
+
 ## Notes and trade-offs
 
 - **DEM resolution.** We use SRTM 1-arc-second (~30 m) because it's globally

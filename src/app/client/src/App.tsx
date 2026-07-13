@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PickingInfo } from "@deck.gl/core";
 import { FloodMap, THEMES, type ViewState, type MapTheme } from "./FloodMap";
 import { AddressCard } from "./AddressCard";
+import { Chat } from "./Chat";
 import {
   api,
   type AOI,
@@ -74,6 +75,10 @@ export default function App() {
   const [hover, setHover] = useState<PickingInfo | null>(null);
   const [addressHit, setAddressHit] = useState<AddressLookup | null>(null);
   const [showBuildings, setShowBuildings] = useState(false);
+  // Buildings layer has its own probability floor, decoupled from the hex
+  // layer's `threshold`. Default 0.2 keeps the layer focused on cells with
+  // material risk; drop to 0 to paint every building (slow at full AOI zoom).
+  const [buildingsThreshold, setBuildingsThreshold] = useState(0.2);
   const [buildings, setBuildings] = useState<BuildingExposure[]>([]);
   const [buildingsLoading, setBuildingsLoading] = useState(false);
   const [buildingsTotalEl, setBuildingsTotalEl] = useState(0);
@@ -209,14 +214,10 @@ export default function App() {
       return;
     }
     const snapped = snap(scenarioMm, scenarios);
-    // Underwriter overlay only cares about cells with real risk - clamp the
-    // floor so the layer doesn't paint 100% of buildings when the user drags
-    // the prob slider to 0.
-    const bldThreshold = Math.max(0.2, threshold);
     let cancelled = false;
     setBuildingsLoading(true);
     const handle = window.setTimeout(() => {
-      api.buildingsAtRisk(aoi, snapped, bldThreshold, viewportBbox)
+      api.buildingsAtRisk(aoi, snapped, buildingsThreshold, viewportBbox)
         .then((r) => {
           if (cancelled) return;
           setBuildings(r.buildings);
@@ -230,7 +231,7 @@ export default function App() {
       cancelled = true;
       window.clearTimeout(handle);
     };
-  }, [showBuildings, aoi, scenarioMm, threshold, scenarios, viewportBbox]);
+  }, [showBuildings, aoi, scenarioMm, buildingsThreshold, scenarios, viewportBbox]);
 
   // Drop stale buildings when the layer is toggled off so the next enable
   // doesn't flash old polygons before the new fetch lands.
@@ -412,6 +413,22 @@ export default function App() {
           {buildingsLoading && <span className="toggle-loading">loading…</span>}
         </label>
 
+        {showBuildings && (
+          <div className="row row-sub">
+            <label htmlFor="bld-thr">Building risk floor</label>
+            <input
+              id="bld-thr"
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={buildingsThreshold}
+              onChange={(e) => setBuildingsThreshold(parseFloat(e.target.value))}
+            />
+            <span className="value">{buildingsThreshold.toFixed(2)}</span>
+          </div>
+        )}
+
         <div className="metrics">
           <div className="kpi">
             <span>Scenario</span>
@@ -485,6 +502,8 @@ export default function App() {
           )}
         </div>
       </aside>
+
+      <Chat aoi={aoi} scenarioMm={snappedScenario} />
 
       <div className="legend">
         <div>Flood probability - {snappedScenario} mm / 24 h scenario</div>

@@ -89,10 +89,35 @@ export type AddressLookup = {
   sweep: [number, number][];
 };
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const r = await fetch(url);
+export type ChatStatus = "PENDING" | "COMPLETED" | "FAILED";
+
+export type ChatMessage = {
+  conversation_id: string;
+  message_id: string;
+  status: ChatStatus;
+  text: string | null;
+  sql: string | null;
+  columns: string[] | null;
+  rows: (string | number | boolean | null)[][] | null;
+  row_count: number | null;
+  truncated: boolean;
+  error: string | null;
+};
+
+export type ChatHealth = { enabled: boolean; space_id: string | null };
+
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const r = await fetch(url, init);
   if (!r.ok) throw new Error(`${url} -> ${r.status} ${r.statusText}`);
   return (await r.json()) as T;
+}
+
+function postJson<T>(url: string, body: unknown): Promise<T> {
+  return fetchJson<T>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 export const api = {
@@ -140,5 +165,23 @@ export const api = {
     fetchJson<AddressLookup>(
       `/api/lookup?aoi=${encodeURIComponent(aoi)}&scenario_mm=${scenarioMm}` +
         `&q=${encodeURIComponent(query)}`,
+    ),
+  chatHealth: () => fetchJson<ChatHealth>("/api/chat/health"),
+  chatStart: (content: string, aoi?: string, scenarioMm?: number) =>
+    postJson<ChatMessage>("/api/chat/start", {
+      content,
+      aoi: aoi ?? null,
+      scenario_mm: scenarioMm ?? null,
+    }),
+  chatSend: (conversationId: string, content: string, aoi?: string, scenarioMm?: number) =>
+    postJson<ChatMessage>("/api/chat/message", {
+      conversation_id: conversationId,
+      content,
+      aoi: aoi ?? null,
+      scenario_mm: scenarioMm ?? null,
+    }),
+  chatPoll: (conversationId: string, messageId: string) =>
+    fetchJson<ChatMessage>(
+      `/api/chat/message/${encodeURIComponent(conversationId)}/${encodeURIComponent(messageId)}`,
     ),
 };

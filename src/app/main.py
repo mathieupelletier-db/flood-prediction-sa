@@ -50,6 +50,14 @@ COMMERCIAL_BRC_USD = float(os.environ.get("COMMERCIAL_BRC_USD", "1500000"))
 FLOOD_LOSS_SEVERITY = float(os.environ.get("FLOOD_LOSS_SEVERITY", "0.25"))
 MAX_BUILDINGS = int(os.environ.get("MAX_BUILDINGS_PER_REQUEST", "8000"))
 
+# Genie Space backing the underwriter chat panel. Provisioned out-of-band by
+# `scripts/genie_bootstrap.py` and wired into the app at deploy time via the
+# DATABRICKS_GENIE_SPACE_ID env var. When unset the /api/chat/* routes return
+# 503 so the frontend can hide the chat panel cleanly.
+GENIE_SPACE_ID = os.environ.get("DATABRICKS_GENIE_SPACE_ID", "").strip()
+GENIE_POLL_TIMEOUT_S = float(os.environ.get("GENIE_POLL_TIMEOUT_S", "60"))
+GENIE_MAX_RESULT_ROWS = int(os.environ.get("GENIE_MAX_RESULT_ROWS", "200"))
+
 NS = f"`{CATALOG}`.`{SCHEMA}`"
 
 # Databricks Apps injects DATABRICKS_HOST, DATABRICKS_HTTP_PATH (warehouse) and
@@ -714,6 +722,249 @@ def lookup(
         ),
         sweep=sweep,
     )
+
+
+# Underwriter chat (Genie Conversation API) -----------------------------------
+
+
+class ChatStartRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+    aoi: str | None = None
+    scenario_mm: int | None = None
+
+
+class ChatMessageRequest(BaseModel):
+    conversation_id: str
+    content: str = Field(min_length=1, max_length=2000)
+    aoi: str | None = None
+    scenario_mm: int | None = None
+
+
+class ChatMessage(BaseModel):
+    conversation_id: str
+    message_id: str
+    status: str  # PENDING | COMPLETED | FAILED
+    text: str | None = None
+    sql: str | None = None
+    columns: list[str] | None = None
+    rows: list[list[Any]] | None = None
+    row_count: int | None = None
+    truncated: bool = False
+    error: str | None = None
+
+
+def _genie_headers() -> dict[str, str]:
+    """Build an Authorization header for the Genie REST API using the same
+    auth-source priority as `_connect()`. Genie sits on the workspace API
+    surface so PAT / SP-OAuth / CLI-profile all work."""
+    if TOKEN:
+        return {"Authorization": f"Bearer {TOKEN}",
+                "Content-Type": "application/json"}
+    if CLIENT_ID and CLIENT_SECRET:
+        from databricks.sdk.core import Config, oauth_service_principal
+
+        cfg = Config(host=f"https://{HOST}", client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
+        provider = oauth_service_principal(cfg)
+        return {**provider(), "Content-Type": "application/json"}
+    if PROFILE:
+        from databricks.sdk.core import Config
+
+        cfg = Config(profile=PROFILE)
+        return {**cfg.authenticate(), "Content-Type": "application/json"}
+    raise RuntimeError(
+        "No Databricks auth available for Genie - set DATABRICKS_TOKEN, "
+        "DATABRICKS_CLIENT_ID/SECRET, or DATABRICKS_CONFIG_PROFILE."
+    )
+
+
+def _genie_url(path: str) -> str:
+    if not HOST:
+        raise HTTPException(status_code=503, detail="DATABRICKS_HOST not configured")
+    return f"https://{HOST}{path}"
+
+
+def _require_genie() -> str:
+    if not GENIE_SPACE_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="Underwriter chat is disabled: DATABRICKS_GENIE_SPACE_ID is not set. "
+                   "Run scripts/genie_bootstrap.py and redeploy.",
+        )
+    return GENIE_SPACE_ID
+
+
+def _genie_user_prompt(content: str, aoi: str | None, scenario_mm: int | None) -> str:
+    """Prefix the user's question with the current map context. This is the
+    single biggest accuracy lever for Genie: when the user types 'total EL
+    at this scenario' we silently substitute the slider values so the
+    generated SQL is concrete."""
+    aoi_ctx = aoi or DEFAULT_AOI
+    bits = [f"Current map context: AOI={aoi_ctx}"]
+    if scenario_mm is not None:
+        bits.append(f"scenario={int(scenario_mm)} mm/24h")
+    return f"{'; '.join(bits)}.\n\nQuestion: {content}"
+
+
+def _normalize_genie_message(conv_id: str, msg: dict[str, Any]) -> ChatMessage:
+    """Coerce the (still-evolving) Genie REST message shape into our typed
+    ChatMessage. Status is one of: PENDING (Genie still working), COMPLETED
+    (assistant turn ready), FAILED."""
+    # Normalize Genie's many intermediate states (IN_PROGRESS,
+    # EXECUTING_QUERY, FETCHING_METADATA, FILTERING_CONTEXT, ASKING_AI,
+    # PENDING_WAREHOUSE, SUBMITTED, ...) to a single PENDING so the frontend
+    # only has to special-case the two terminal states. Allowlisting failed
+    # in practice because Genie keeps adding new intermediate statuses; we
+    # invert the logic - anything not explicitly terminal is "still working".
+    raw_status = (msg.get("status") or "").upper()
+    if raw_status == "COMPLETED":
+        status = "COMPLETED"
+    elif raw_status in {"FAILED", "QUERY_RESULT_EXPIRED", "CANCELLED"}:
+        status = "FAILED"
+    else:
+        status = "PENDING"
+
+    sql: str | None = None
+    columns: list[str] | None = None
+    rows: list[list[Any]] | None = None
+    row_count: int | None = None
+    truncated = False
+
+    # Genie returns attachments[]: each can be a `text` (assistant message)
+    # or `query` (generated SQL + result rows). We surface the first of each.
+    for att in msg.get("attachments", []) or []:
+        if "query" in att and sql is None:
+            q = att["query"]
+            sql = q.get("query")
+            result = q.get("query_result") or q.get("result") or {}
+            if isinstance(result, dict):
+                schema = result.get("schema") or result.get("manifest", {}).get("schema") or {}
+                cols = schema.get("columns") or schema.get("column_names") or []
+                if cols and isinstance(cols[0], dict):
+                    columns = [c.get("name") for c in cols if c.get("name")]
+                else:
+                    columns = list(cols) if cols else None
+                data_rows = (result.get("data_array")
+                             or result.get("rows")
+                             or result.get("data", {}).get("data_array") if isinstance(result.get("data"), dict) else None)
+                if isinstance(data_rows, list):
+                    if len(data_rows) > GENIE_MAX_RESULT_ROWS:
+                        truncated = True
+                        data_rows = data_rows[:GENIE_MAX_RESULT_ROWS]
+                    rows = data_rows
+                    row_count = result.get("row_count") or len(data_rows)
+
+    text: str | None = None
+    for att in msg.get("attachments", []) or []:
+        if "text" in att and isinstance(att["text"], dict):
+            text = att["text"].get("content") or text
+
+    error = None
+    if status == "FAILED":
+        error = msg.get("error", {}).get("error_message") if isinstance(msg.get("error"), dict) else str(msg.get("error") or "Genie failed")
+
+    return ChatMessage(
+        conversation_id=conv_id,
+        message_id=msg.get("message_id") or msg.get("id") or "",
+        status=status,
+        text=text,
+        sql=sql,
+        columns=columns,
+        rows=rows,
+        row_count=row_count,
+        truncated=truncated,
+        error=error,
+    )
+
+
+@app.get("/api/chat/health")
+def chat_health() -> dict[str, Any]:
+    return {"enabled": bool(GENIE_SPACE_ID), "space_id": GENIE_SPACE_ID or None}
+
+
+@app.post("/api/chat/start", response_model=ChatMessage)
+def chat_start(req: ChatStartRequest) -> ChatMessage:
+    space_id = _require_genie()
+    body = {"content": _genie_user_prompt(req.content, req.aoi, req.scenario_mm)}
+    r = requests.post(
+        _genie_url(f"/api/2.0/genie/spaces/{space_id}/start-conversation"),
+        headers=_genie_headers(),
+        json=body,
+        timeout=15,
+    )
+    if r.status_code >= 400:
+        log.warning("Genie start-conversation %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail=f"Genie {r.status_code}: {r.text[:200]}")
+    payload = r.json() or {}
+    conv_id = payload.get("conversation_id") or payload.get("conversation", {}).get("id")
+    msg = payload.get("message") or {}
+    if not conv_id:
+        raise HTTPException(status_code=502, detail="Genie did not return a conversation_id")
+    return _normalize_genie_message(conv_id, msg)
+
+
+@app.post("/api/chat/message", response_model=ChatMessage)
+def chat_message(req: ChatMessageRequest) -> ChatMessage:
+    space_id = _require_genie()
+    body = {"content": _genie_user_prompt(req.content, req.aoi, req.scenario_mm)}
+    r = requests.post(
+        _genie_url(
+            f"/api/2.0/genie/spaces/{space_id}/conversations/{req.conversation_id}/messages"
+        ),
+        headers=_genie_headers(),
+        json=body,
+        timeout=15,
+    )
+    if r.status_code >= 400:
+        log.warning("Genie send-message %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail=f"Genie {r.status_code}: {r.text[:200]}")
+    return _normalize_genie_message(req.conversation_id, r.json() or {})
+
+
+@app.get("/api/chat/message/{conversation_id}/{message_id}", response_model=ChatMessage)
+def chat_poll(conversation_id: str, message_id: str) -> ChatMessage:
+    """Poll a Genie message until it reaches COMPLETED (or FAILED). The
+    frontend long-polls this every ~1.2s while status == PENDING."""
+    space_id = _require_genie()
+    r = requests.get(
+        _genie_url(
+            f"/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}"
+        ),
+        headers=_genie_headers(),
+        timeout=15,
+    )
+    if r.status_code >= 400:
+        log.warning("Genie poll %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail=f"Genie {r.status_code}: {r.text[:200]}")
+    msg = _normalize_genie_message(conversation_id, r.json() or {})
+
+    # If Genie returned a query attachment but no rows (newer API splits result
+    # fetch onto its own sub-resource), fetch it explicitly.
+    if msg.status == "COMPLETED" and msg.sql is not None and msg.rows is None:
+        raw = r.json() or {}
+        for att in raw.get("attachments", []) or []:
+            att_id = att.get("attachment_id") or att.get("id")
+            if "query" in att and att_id:
+                qr = requests.get(
+                    _genie_url(
+                        f"/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}"
+                        f"/messages/{message_id}/attachments/{att_id}/query-result"
+                    ),
+                    headers=_genie_headers(),
+                    timeout=30,
+                )
+                if qr.status_code < 400:
+                    stmt = qr.json().get("statement_response", {}).get("result", {})
+                    cols = (qr.json().get("statement_response", {})
+                            .get("manifest", {}).get("schema", {}).get("columns", []))
+                    msg.columns = [c.get("name") for c in cols] or msg.columns
+                    data = stmt.get("data_array") or []
+                    if len(data) > GENIE_MAX_RESULT_ROWS:
+                        msg.truncated = True
+                        data = data[:GENIE_MAX_RESULT_ROWS]
+                    msg.rows = data
+                    msg.row_count = stmt.get("row_count") or len(data)
+                    break
+    return msg
 
 
 # Static SPA -------------------------------------------------------------------

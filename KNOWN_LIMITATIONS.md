@@ -95,6 +95,80 @@ a visual upgrade.
    table up on next process start and switches `footprint_source` from
    `"synthesized"` to `"real"` in the response.
 
+### Underwriter chatbot can't explain how the model works
+
+**Symptom.** Ask the chat panel "how is `flood_prob` computed?" or "why is
+this building in the severe tier?" and it will either refuse or hallucinate.
+
+**Root cause.** The chatbot is a **pure Genie Space** — natural language in,
+SQL out, no document retrieval. It only knows what's queryable from the four
+gold tables. Model internals (the RandomForest, the feature engineering, the
+hybrid label) are not in those tables; they live in `BLOG.md` and the
+notebooks.
+
+**Why we're leaving it.** Genie is purpose-built for the underwriter
+question class (aggregates, slicing, top-N, scenario stress). Mixing
+doc retrieval in requires a Knowledge Assistant alongside Genie, orchestrated
+either by a Multi-Agent Supervisor or a custom Agent Framework agent —
+roughly 4-5x the build effort for a question class the underwriter persona
+doesn't actually need.
+
+**Upgrade path.** Add a Knowledge Assistant pointed at `README.md`,
+`BLOG.md`, and `KNOWN_LIMITATIONS.md`; wire both into an Agent Bricks
+Multi-Agent Supervisor; have the supervisor route data questions to Genie
+and explanation questions to the KA. See [resources/genie/flood_underwriter.json](resources/genie/flood_underwriter.json)
+"general_instructions" — the space already tells users to consult the README
+for these questions.
+
+### Underwriter chatbot can't drive the map
+
+**Symptom.** Ask "zoom to this address" or "set the rainfall slider to
+100 mm" and the chatbot will (correctly) tell you it can't do that.
+
+**Root cause.** Genie's contract is SQL only — no tool calls, no UI
+mutations. The map controls already live in the side panel and the address
+search box already covers "is my address at risk" with single-building
+precision.
+
+**Upgrade path.** If map-action questions become important, wrap the
+existing `/api/lookup` and the FloodMap setters as tools on a Mosaic AI
+Agent Framework agent, and replace `/api/chat/*` with that agent's
+endpoint. The Genie space becomes one of that agent's tools (via the
+`ask_genie` action) so SQL questions still work.
+
+### Underwriter cost numbers are flat constants, not policy data
+
+**Symptom.** The chatbot's expected-loss math (and the buildings-at-risk
+overlay's tooltip $$) uses the same numbers for every residential building
+and the same numbers for every commercial building, regardless of
+square-footage, occupancy class, construction type, year built, or insured
+value. Real underwriters never accept a portfolio-level number computed this
+way.
+
+**Root cause.** `gold_underwriting_assumptions` ships two rows
+(residential = $300K BRC, commercial = $1.5M BRC, 25% flat loss severity)
+as demo placeholders. There's no policy book, no replacement-cost estimator,
+and no depth-damage curve in the pipeline. This is the same caveat as the
+buildings-at-risk overlay constants, just exposed to a chatbot now.
+
+**Upgrade path.** Replace `gold_underwriting_assumptions` with a real
+source, in roughly this order of fidelity:
+1. The carrier's policy book joined on `osm_id ↔ policy_id` via a
+   property-matching service. Per-policy `insured_value`, `coverage_a..d`,
+   `deductible`, `policy_form` -> exact `expected_loss_usd`.
+2. CoreLogic / Verisk / Cotality replacement-cost API keyed by address +
+   sqft + construction type. Cached as a Delta table joined to
+   `gold_building_exposure` by `osm_id`.
+3. Public assessor rolls (Quebec rôle d'évaluation foncière, NYC PLUTO).
+   Cheaper, less accurate; good for sandbox demos.
+4. Replace the flat 25% severity with FEMA HAZUS depth-damage curves keyed
+   by occupancy class and a hydraulic-model depth-of-flood per cell — but
+   that also requires a depth model the current pipeline doesn't have.
+
+Until that swap happens, `expected_loss_usd` should be read as a *demo
+signal*, not a portfolio reserve number. The chatbot's space instructions
+already say "treat the dollar values as demo assumptions, not policy data".
+
 ### Hybrid labels mix synthetic and real
 
 The model trains on a rainfall-aware **synthetic susceptibility label**, with
