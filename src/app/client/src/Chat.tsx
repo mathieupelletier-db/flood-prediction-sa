@@ -75,7 +75,7 @@ function loadConvId(): string | null {
 
 export function Chat({ aoi, scenarioMm }: Props) {
   const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const [turns, setTurns] = useState<Turn[]>(() => loadStored());
   const [conversationId, setConversationId] = useState<string | null>(() => loadConvId());
   const [input, setInput] = useState("");
