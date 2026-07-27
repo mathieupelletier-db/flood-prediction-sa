@@ -69,7 +69,9 @@ export default function App() {
   // the overlay off/on doesn't refetch.
   const eventsCacheRef = useRef<Map<string, FloodEvent[]>>(new Map());
   const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [loading, setLoading] = useState(false);
+  // Start true so the initial AOI → scenarios → predictions chain shows a
+  // loader from first paint instead of an empty map.
+  const [loading, setLoading] = useState(true);
   const [overlayLoading, setOverlayLoading] = useState(false);
   const [view, setView] = useState<ViewState>(DEFAULT_VIEW);
   const [hover, setHover] = useState<PickingInfo | null>(null);
@@ -112,14 +114,22 @@ export default function App() {
   }, [aoi, aois]);
 
   useEffect(() => {
+    setLoading(true);
     api.listScenarios(aoi)
       .then((r) => {
         setScenarios(r.scenarios_24h_mm);
         if (r.scenarios_24h_mm.length) {
           setScenarioMm((prev) => snap(prev, r.scenarios_24h_mm));
+        } else {
+          setCells([]);
+          setMetrics(null);
+          setLoading(false);
         }
       })
-      .catch(console.error);
+      .catch((err) => {
+        console.error(err);
+        setLoading(false);
+      });
   }, [aoi]);
 
   useEffect(() => {
@@ -330,8 +340,8 @@ export default function App() {
       </div>
 
       <aside className="panel">
-        <h1>Montreal Flood Risk</h1>
-        <p className="subtitle">GeoBrix + Spatial SQL + Spark ML</p>
+        <h1>Underwriting Flood Risk</h1>
+        <p className="subtitle">Scenario-based flood risk and property exposure</p>
 
         <AddressCard
           aoi={aoi}
@@ -525,7 +535,17 @@ export default function App() {
         )}
       </div>
 
-      {loading && <div className="spinner">Loading predictions...</div>}
+      {loading && (
+        <div
+          className={`loader${cells.length === 0 ? " loader-initial" : ""}`}
+          data-testid="prediction-loading"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="loader-spinner" aria-hidden="true" />
+          <span>{cells.length === 0 ? "Loading flood risk data…" : "Updating predictions…"}</span>
+        </div>
+      )}
       {overlayLoading && !loading && (
         <div className="spinner">Loading historical flood overlay…</div>
       )}

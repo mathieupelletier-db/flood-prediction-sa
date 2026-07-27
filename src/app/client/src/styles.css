@@ -538,3 +538,49 @@ html, body, #root { margin: 0; padding: 0; height: 100%; width: 100%; background
   padding: 8px 14px;
   border-radius: 6px;
 }
+
+.loader {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: #e6edf3;
+  font-size: 13px;
+  background: rgba(13, 17, 23, 0.88);
+  border: 1px solid #30363d;
+  padding: 12px 18px;
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.loader-initial {
+  inset: 0;
+  top: 0;
+  left: 0;
+  transform: none;
+  justify-content: center;
+  border: 0;
+  border-radius: 0;
+  background: rgba(13, 17, 23, 0.72);
+  backdrop-filter: blur(2px);
+  box-shadow: none;
+}
+
+.loader-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #30363d;
+  border-top-color: #58a6ff;
+  border-radius: 50%;
+  animation: loader-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes loader-spin {
+  to { transform: rotate(360deg); }
+}
