@@ -431,6 +431,18 @@ jobs:
               os.remove('notebook_fragments.json')
           EOF
 
+      # Keep the pitch deck at the site root when docs/index.html is present,
+      # and publish the notebook SPA under /accelerator/.
+      - name: Merge pitch docs into site
+        run: |
+          if [ -f docs/index.html ]; then
+            mkdir -p site/accelerator
+            if [ -f site/index.html ]; then
+              mv site/index.html site/accelerator/index.html
+            fi
+            cp docs/index.html site/index.html
+          fi
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
