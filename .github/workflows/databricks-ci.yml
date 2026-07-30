@@ -28,8 +28,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Pin Node explicitly. The runner default (Node 24 / npm 11) hangs during
-      # `npm ci` and aborts with "Exit handler never called!".
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -39,13 +37,27 @@ jobs:
 
       # Install and build before making any deployment credential available.
       # npm lifecycle scripts must not be able to read the Databricks token.
+      #
+      # The public registry is pinned here because lockfiles regenerated on the
+      # Databricks network resolve to an internal proxy the runner cannot reach.
+      # npm can also die without setting an exit code, so the install is bounded
+      # by a timeout and node_modules is verified before the build runs.
       - name: Build React SPA
         working-directory: src/app/client
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+          NPM_CONFIG_FETCH_TIMEOUT: '120000'
+          NPM_CONFIG_FETCH_RETRIES: '2'
         run: |
+          set -euo pipefail
           if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
+            timeout 10m npm ci --no-audit --no-fund
           else
-            npm install --no-audit --no-fund
+            timeout 10m npm install --no-audit --no-fund
+          fi
+          if [ ! -d node_modules/react ]; then
+            echo "::error::npm install did not produce node_modules; aborting before build"
+            exit 1
           fi
           npm run build
 
