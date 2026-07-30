@@ -28,15 +28,24 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Pin Node explicitly. The runner default (Node 24 / npm 11) hangs during
+      # `npm ci` and aborts with "Exit handler never called!".
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/app/client/package-lock.json
+
       # Install and build before making any deployment credential available.
       # npm lifecycle scripts must not be able to read the Databricks token.
       - name: Build React SPA
+        working-directory: src/app/client
         run: |
-          cd src/app/client
           if [ -f package-lock.json ]; then
-            npm ci
+            npm ci --no-audit --no-fund
           else
-            npm install
+            npm install --no-audit --no-fund
           fi
           npm run build
 
