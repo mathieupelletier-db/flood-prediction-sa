@@ -26,16 +26,30 @@ variables:
     description: "UC Volume that stores raw downloaded rasters/shapes"
     default: "raw"
 
-  aoi_name:
-    description: "Short slug for the area of interest (used as subfolder + partition key)"
-    default: "greater_montreal"
-  aoi_bbox_wkt:
-    description: "AOI polygon as WKT in EPSG:4326, used to clip rasters and vectors"
-    default: "POLYGON((-74.05 45.30, -73.30 45.30, -73.30 45.80, -74.05 45.80, -74.05 45.30))"
-  aoi_bbox_min_lon: { default: "-74.05" }
-  aoi_bbox_min_lat: { default: "45.30" }
-  aoi_bbox_max_lon: { default: "-73.30" }
-  aoi_bbox_max_lat: { default: "45.80" }
+  aois_json:
+    description: |-
+      JSON array of AOI configurations. The pipeline fans out per entry via
+      `for_each_task` so every AOI ends up co-resident in the same catalog
+      and is selectable from the App's AOI dropdown. Each entry must include:
+        - name              short slug, also used as the volume subfolder
+                            and partition key on every Delta table
+        - min_lon / min_lat / max_lon / max_lat   bbox in EPSG:4326
+        - wkt               same bbox as a WKT polygon (used for raster clipping)
+        - flood_source      'melcc' | 'cems' | 'none' (see 01_ingest.py)
+        - cems_urls         comma-separated GeoJSON URLs (only when flood_source=cems)
+        - cems_year_default fallback year when flood_source=cems and no year is
+                            present in feature props or filenames
+      Override at deploy time with --var=aois_json=$(cat my_aois.json) if the
+      list grows beyond what's comfortable inline here.
+    default: |-
+      [
+        {"name":"greater_montreal","min_lon":"-74.05","min_lat":"45.30","max_lon":"-73.30","max_lat":"45.80","wkt":"POLYGON((-74.05 45.30, -73.30 45.30, -73.30 45.80, -74.05 45.80, -74.05 45.30))","flood_source":"melcc","cems_urls":"","cems_year_default":""},
+        {"name":"manhattan","min_lon":"-74.05","min_lat":"40.68","max_lon":"-73.90","max_lat":"40.88","wkt":"POLYGON((-74.05 40.68, -73.90 40.68, -73.90 40.88, -74.05 40.88, -74.05 40.68))","flood_source":"none","cems_urls":"","cems_year_default":""}
+      ]
+
+  for_each_concurrency:
+    description: "Max number of AOIs the pipeline will process in parallel within each stage (ingest / silver / gold / train_and_score). Bumping this above 1 reuses the same job cluster, so watch driver memory."
+    default: "1"
 
   h3_resolution:
     description: "H3 resolution used for feature grid (9 ~ 174 m edge)"
@@ -46,7 +60,22 @@ variables:
     default: "10,30,60,100,150,200"
 
   warehouse_id:
-    description: "Serverless SQL warehouse the app queries"
+    description: "Serverless SQL warehouse the app queries. Resolved via lookup by default; override with --var=warehouse_id=<id> if you don't have a warehouse named 'Shared Unity Catalog Serverless'."
+    lookup:
+      warehouse: "Shared Unity Catalog Serverless"
+
+  genie_space_id:
+    description: |-
+      Id of the Genie Space backing the underwriter chat panel. Created
+      out-of-band by `scripts/genie_bootstrap.py` (DABs has no managed
+      `genie_space` resource type yet). Leave empty to deploy the app
+      without chat; the panel will hide itself. Bootstrap workflow:
+
+          GENIE_SPACE_ID=$(python scripts/genie_bootstrap.py \
+              --profile <p> --catalog <c> --schema <s> \
+              --warehouse-id ${var.warehouse_id} \
+              --grant-sp <app-sp-application-id>)
+          databricks bundle deploy -t dev --var=genie_space_id=$GENIE_SPACE_ID
     default: ""
 
   model_name:
@@ -57,16 +86,6 @@ targets:
   dev:
     default: true
     mode: development
-    variables:
-      catalog: "catalog_j4zl8j_om2ldn"
-      # `mode: development` auto-prefixes this with `dev_${short_user}_`, so the
-      # actual UC name lands at `catalog_j4zl8j_om2ldn.dev_mathieu_pelletier_mpelletier_flood_montreal_dev`.
-      # Do NOT include the `dev_<user>_` prefix here or it will be doubled.
-      schema: "mpelletier_flood_montreal_dev"
-      warehouse_id: "0334a8e49aac8b19"
 
   prod:
     mode: production
-    variables:
-      catalog: "catalog_j4zl8j_om2ldn"
-      schema: "montreal"

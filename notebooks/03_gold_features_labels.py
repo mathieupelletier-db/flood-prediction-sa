@@ -32,14 +32,22 @@ scenarios = [int(s.strip()) for s in dbutils.widgets.get("scenarios_24h_mm").spl
 ns = f"{catalog}.{schema}"
 print("Scenarios (mm/24h):", scenarios)
 
+# Multi-AOI co-residence: every gold table is partitioned by aoi_name and we
+# write only the active AOI's rows. `CREATE OR REPLACE TABLE ... AS SELECT`
+# would replace the whole table on each run, so we compute the rows via
+# spark.sql() and write through the DataFrame API with dynamic partition
+# overwrite — see 01_ingest.py for the full rationale.
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
+from pyspark.sql import functions as F
+
 # COMMAND ----------
 
 # MAGIC %md ## Build feature table
 
 # COMMAND ----------
 
-spark.sql(f"""
-  CREATE OR REPLACE TABLE {ns}.gold_h3_features AS
+features_df = spark.sql(f"""
   WITH joined AS (
     SELECT e.aoi_name,
            e.h3,
@@ -66,7 +74,13 @@ spark.sql(f"""
          LN(1.0 / (slope_deg + 0.5)) - LN(dist_to_water_m + 1.0) AS twi
   FROM joined
 """)
-print("gold_h3_features:", spark.table(f"{ns}.gold_h3_features").count())
+(features_df.write.mode("overwrite")
+            .partitionBy("aoi_name")
+            .saveAsTable(f"{ns}.gold_h3_features"))
+print("gold_h3_features:",
+      spark.table(f"{ns}.gold_h3_features")
+           .where(F.col("aoi_name") == aoi_name).count(),
+      "(this AOI)")
 
 # COMMAND ----------
 
@@ -82,11 +96,15 @@ spark.sql(f"""
   WHERE aoi_name = '{aoi_name}'
 """)
 
-spark.sql(f"""
-  CREATE OR REPLACE TABLE {ns}.gold_h3_labels AS
+labels_df = spark.sql(f"""
   WITH centroids AS (
+    -- Restrict to the current AOI's cells; without this filter the labels
+    -- table would tag every other AOI's H3 cells with the current AOI's
+    -- flood polygons (which is silently wrong even when the spatial join
+    -- returns zero matches because the row carries the wrong aoi_name).
     SELECT h3, ST_GeomFromGeoJSON(h3_centerasgeojson(h3)) AS geom
     FROM {ns}.gold_h3_features
+    WHERE aoi_name = '{aoi_name}'
   )
   SELECT '{aoi_name}' AS aoi_name,
          c.h3,
@@ -95,8 +113,12 @@ spark.sql(f"""
   LEFT JOIN v_flood_polys f ON ST_Intersects(c.geom, f.geom)
   GROUP BY c.h3
 """)
+(labels_df.write.mode("overwrite")
+          .partitionBy("aoi_name")
+          .saveAsTable(f"{ns}.gold_h3_labels"))
 print("gold_h3_labels positives:", spark.sql(
-    f"SELECT SUM(label_real) FROM {ns}.gold_h3_labels").collect()[0][0])
+    f"SELECT SUM(label_real) FROM {ns}.gold_h3_labels "
+    f"WHERE aoi_name = '{aoi_name}'").collect()[0][0])
 
 # COMMAND ----------
 
@@ -130,6 +152,7 @@ q = (spark.sql(f"""
     percentile_approx(annual_precip_mm, 0.20) AS p20_precip,
     percentile_approx(annual_precip_mm, 0.80) AS p80_precip
   FROM {ns}.gold_h3_features
+  WHERE aoi_name = '{aoi_name}'
 """).collect()[0])
 p20_elev, p80_elev = float(q["p20_elev"]), float(q["p80_elev"])
 p80_dist = float(q["p80_dist"])
@@ -142,10 +165,10 @@ print(f"Quantiles: elev [{p20_elev:.1f}, {p80_elev:.1f}]  dist_p80={p80_dist:.0f
 
 scenarios_sql = ", ".join(f"({s})" for s in scenarios)
 
-spark.sql(f"""
-  CREATE OR REPLACE TABLE {ns}.gold_h3_training AS
+training_df = spark.sql(f"""
   WITH feats AS (
     SELECT * FROM {ns}.gold_h3_features
+    WHERE aoi_name = '{aoi_name}'
   ),
   scen(scenario_24h_mm) AS (VALUES {scenarios_sql}),
   cross AS (
@@ -186,13 +209,19 @@ spark.sql(f"""
               THEN 1 ELSE 0 END AS label_synthetic
   FROM labelled
 """)
-print("gold_h3_training rows:", spark.table(f"{ns}.gold_h3_training").count())
+(training_df.write.mode("overwrite")
+            .partitionBy("aoi_name")
+            .saveAsTable(f"{ns}.gold_h3_training"))
+print("gold_h3_training rows (this AOI):",
+      spark.table(f"{ns}.gold_h3_training")
+           .where(F.col("aoi_name") == aoi_name).count())
 
 display(spark.sql(f"""
   SELECT scenario_24h_mm,
          COUNT(*) AS rows,
          ROUND(AVG(label_synthetic), 4) AS positive_rate
   FROM {ns}.gold_h3_training
+  WHERE aoi_name = '{aoi_name}'
   GROUP BY scenario_24h_mm
   ORDER BY scenario_24h_mm
 """))

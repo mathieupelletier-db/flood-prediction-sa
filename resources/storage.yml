@@ -3,7 +3,16 @@ resources:
     flood_schema:
       catalog_name: ${var.catalog}
       name: ${var.schema}
-      comment: "Flood prediction demo - bronze/silver/gold tables for ${var.aoi_name}"
+      comment: "Flood prediction demo - bronze/silver/gold tables across every AOI in var.aois_json"
+      grants:
+        # Grant the Databricks App's auto-created service principal read access
+        # to every gold_* table the FastAPI backend queries. Bundle deploy
+        # creates the app first, so service_principal_client_id is resolved
+        # before this grant is applied.
+        - principal: ${resources.apps.flood_app.service_principal_client_id}
+          privileges:
+            - USE_SCHEMA
+            - SELECT
 
   volumes:
     flood_raw:

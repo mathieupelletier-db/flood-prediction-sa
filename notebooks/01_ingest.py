@@ -30,6 +30,11 @@ dbutils.widgets.text("aoi_bbox_max_lat", "45.80")
 # notebook works both inside the DAB job and when run interactively.
 dbutils.widgets.text("raw_root", "")
 
+# Flood-polygon source dispatch. See databricks.yml for the full descriptions.
+dbutils.widgets.dropdown("flood_source", "melcc", ["melcc", "cems", "none"])
+dbutils.widgets.text("cems_urls", "")
+dbutils.widgets.text("cems_year_default", "")
+
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 aoi_name = dbutils.widgets.get("aoi_name")
@@ -38,6 +43,9 @@ min_lat = float(dbutils.widgets.get("aoi_bbox_min_lat"))
 max_lon = float(dbutils.widgets.get("aoi_bbox_max_lon"))
 max_lat = float(dbutils.widgets.get("aoi_bbox_max_lat"))
 raw_root_param = dbutils.widgets.get("raw_root")
+flood_source = (dbutils.widgets.get("flood_source") or "melcc").strip().lower()
+cems_urls_raw = dbutils.widgets.get("cems_urls") or ""
+cems_year_default = (dbutils.widgets.get("cems_year_default") or "").strip()
 
 import os
 
@@ -48,6 +56,13 @@ else:
     raw_root = f"/Workspace/Users/{user}/flood-demo/raw"
 volume_root = f"{raw_root}/{aoi_name}"
 os.makedirs(volume_root, exist_ok=True)
+
+# Multi-AOI co-residence: every bronze table is partitioned by aoi_name, and we
+# rely on dynamic partition overwrite so a `mode("overwrite")` write only
+# replaces the current AOI's partition instead of wiping the entire table.
+# Without this, running the pipeline for AOI #2 would erase AOI #1's bronze
+# rows and the App's AOI dropdown would shrink back to a single entry.
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
 print(f"AOI {aoi_name}: ({min_lon},{min_lat}) -> ({max_lon},{max_lat})")
 print("Raw data root:", volume_root)
@@ -244,32 +259,35 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Historical flood polygons (Quebec 2017 / 2019 ZIS)
+# MAGIC ## 3. Historical flood polygons (pluggable source)
 # MAGIC
-# MAGIC Pulled from the authoritative Ministère de l'Environnement ArcGIS
-# MAGIC Feature Service backing the Données Québec "Territoire inondé en 2017 et
-# MAGIC 2019" dataset, bbox-filtered server-side to the AOI. The dataset is a
-# MAGIC single ZIS (zone d'intervention spéciale) layer whose polygons cover the
-# MAGIC combined 2017 + 2019 inundation extents; we tag each feature with the
-# MAGIC decree year for the map overlay.
+# MAGIC Three sources, dispatched on the `flood_source` widget:
+# MAGIC
+# MAGIC * **`melcc`** (default) — Quebec MDDELCC ArcGIS Feature Service backing
+# MAGIC   the Données Québec "Territoire inondé en 2017 et 2019" dataset.
+# MAGIC   Quebec-only; raises if 0 features intersect the AOI bbox.
+# MAGIC * **`cems`** — Copernicus Emergency Management Service Rapid Mapping.
+# MAGIC   Global. Provide a comma-separated list of GeoJSON URLs in
+# MAGIC   `cems_urls` (browse [emergency.copernicus.eu/mapping](https://emergency.copernicus.eu/mapping/list-of-activations-rapid)
+# MAGIC   for the activation you want and grab the GeoJSON download links).
+# MAGIC   Also auto-picks up any `*.geojson` or `*.json` files dropped manually
+# MAGIC   into `<volume_root>/floods/cems_input/`.
+# MAGIC * **`none`** — write an empty `bronze_flood_events`. The App's validation
+# MAGIC   overlay disappears; the model still trains on synthetic labels.
+# MAGIC
+# MAGIC Whichever source is used, the output is normalized to one row per
+# MAGIC polygon with `(aoi_name, year, geom_geojson)` so downstream notebooks
+# MAGIC don't care where the data came from.
 
 # COMMAND ----------
 
 from datetime import datetime as _dt
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
+import re
 import time
 
-# Single-layer service for the 2017 + 2019 ZIS decree polygons. The MapServer
-# only exposes one polygon layer (id=1) covering the combined 2017 and 2019
-# inundation extents under decree 817-2019; individual features carry the
-# decree's start date (`Date_debut`), not the flood year, so we cannot reliably
-# split the overlay into two year-coloured layers from this source alone.
-flood_path = f"{volume_root}/floods/{aoi_name}_historical.geojson"
-FLOOD_MAPSERVER = (
-    "https://www.servicesgeo.enviroweb.gouv.qc.ca/donnees/rest/services/"
-    "Public/Territoire_inonde_en_2017_et_2019/MapServer/1/query"
-)
-FLOOD_MAX_RECORDS = 1000  # = MapServer maxRecordCount, do not raise
+# Cache file is per-source so swapping `flood_source` doesn't cross-contaminate.
+flood_path = f"{volume_root}/floods/{aoi_name}_historical_{flood_source}.geojson"
 
 # Allow the user to bust the cache without manually deleting the volume file.
 dbutils.widgets.text("force_refresh_floods", "false")
@@ -277,19 +295,40 @@ _force_refresh = dbutils.widgets.get("force_refresh_floods").strip().lower() in 
     "1", "true", "yes")
 
 
-def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat,
-                           page_size=FLOOD_MAX_RECORDS,
-                           max_attempts=4, base_backoff_s=2.0):
-    """Page through the ArcGIS Feature Service for the AOI bbox.
+def _cache_is_usable(path: str, allow_empty: bool = False) -> bool:
+    """A cache parses as a FeatureCollection. Empty is OK iff allow_empty=True."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path) as f:
+            fc = json.load(f)
+    except Exception:
+        return False
+    if not (isinstance(fc, dict) and fc.get("type") == "FeatureCollection"):
+        return False
+    return allow_empty or bool(fc.get("features"))
 
-    Returns a list of GeoJSON features. Each feature gets a synthetic `year`
-    property derived from the `Date_debut` decree-start date — note this is the
-    decree's effective date, not the flood occurrence date, so for the current
-    (combined 2017+2019 ZIS) layer every feature ends up tagged `'2019'`.
 
-    Raises on transport / HTTP failure after `max_attempts` retries with
-    exponential backoff. Does NOT swallow errors — caller must decide how to
-    handle them so we never silently produce an empty cache.
+# ─────────────────────────────────────────────────────────────────────────────
+# MELCC source — Quebec MDDELCC ArcGIS Feature Service
+# ─────────────────────────────────────────────────────────────────────────────
+FLOOD_MAPSERVER = (
+    "https://www.servicesgeo.enviroweb.gouv.qc.ca/donnees/rest/services/"
+    "Public/Territoire_inonde_en_2017_et_2019/MapServer/1/query"
+)
+FLOOD_MAX_RECORDS = 1000  # = MapServer maxRecordCount, do not raise
+
+
+def _fetch_melcc_features(min_lon, min_lat, max_lon, max_lat,
+                          page_size=FLOOD_MAX_RECORDS,
+                          max_attempts=4, base_backoff_s=2.0):
+    """Page through the MDDELCC ArcGIS Feature Service for the AOI bbox.
+
+    Each feature gets a synthetic `year` derived from the `Date_debut` decree
+    timestamp — this is the decree's effective date, not the flood occurrence
+    date, so for the current combined 2017+2019 ZIS layer every feature ends
+    up tagged `'2019'`. Raises on transport / HTTP failure after retries; the
+    caller decides whether 0 features is fatal.
     """
     features: list[dict] = []
     offset = 0
@@ -329,7 +368,6 @@ def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat,
                 f"offset={offset}: {last_err!r}"
             ) from last_err
 
-        # ArcGIS surfaces server-side errors with HTTP 200 + an `error` body.
         if isinstance(payload, dict) and payload.get("error"):
             raise RuntimeError(
                 f"ArcGIS service returned error at offset={offset}: {payload['error']}"
@@ -349,7 +387,6 @@ def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat,
             feat["properties"] = props
             features.append(feat)
 
-        # Trust ArcGIS's own pagination signal first; fall back to length check.
         if not payload.get("exceededTransferLimit") and len(batch) < page_size:
             break
         if not batch:
@@ -358,42 +395,241 @@ def _fetch_flood_features(min_lon, min_lat, max_lon, max_lat,
     return features
 
 
-def _cache_is_usable(path: str) -> bool:
-    """A cache is usable iff it parses as a non-empty FeatureCollection.
+# ─────────────────────────────────────────────────────────────────────────────
+# CEMS source — Copernicus Emergency Management Service Rapid Mapping
+# ─────────────────────────────────────────────────────────────────────────────
+# We accept GeoJSON / JSON URLs (most CEMS Rapid Mapping products are offered
+# as GeoJSON in addition to Shapefile). Shapefile-only zips would require a
+# heavy GDAL/fiona dependency and are intentionally not supported — pick the
+# GeoJSON download from the CEMS portal instead.
+_YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
 
-    An empty FeatureCollection is treated as missing — we'd rather re-fetch
-    than serve a confidently-empty overlay (which is what bit us before)."""
-    if not os.path.exists(path):
+
+def _year_from_string(s: str) -> str:
+    if not s:
+        return ""
+    m = _YEAR_RE.search(s)
+    return m.group(1) if m else ""
+
+
+def _year_from_feature_props(props: dict) -> str:
+    """Best-effort year extraction from CEMS feature properties.
+
+    CEMS schemas vary by activation/provider. Common candidates we've seen:
+    `event_date`, `obs_date`, `acq_date`, `src_date`, `event_year`. Fall
+    through them in order; first parseable year wins.
+    """
+    if not isinstance(props, dict):
+        return ""
+    for key in ("event_year", "year", "event_date", "obs_date", "acq_date",
+                "src_date", "src_acq_da", "Date_debut"):
+        v = props.get(key)
+        if v in (None, ""):
+            continue
+        # Numeric epoch (ms) — same convention as MELCC ArcGIS.
+        if isinstance(v, (int, float)) and v > 10**11:
+            try:
+                return _dt.utcfromtimestamp(v / 1000).strftime("%Y")
+            except Exception:
+                pass
+        s = str(v)
+        y = _year_from_string(s)
+        if y:
+            return y
+    return ""
+
+
+def _bbox_hits(geom: dict, mn_lon, mn_lat, mx_lon, mx_lat) -> bool:
+    """Cheap bbox-vs-bbox prune. CEMS products span large AoIs that may extend
+    well beyond our AOI; clip in-Python to keep bronze focused."""
+    if not geom:
         return False
+    coords = geom.get("coordinates")
+    if coords is None:
+        return False
+
+    def _walk(c):
+        if isinstance(c, (int, float)):
+            return
+        if c and isinstance(c[0], (int, float)):
+            yield c[0], c[1]
+            return
+        for sub in c:
+            yield from _walk(sub)
+
+    pts = list(_walk(coords))
+    if not pts:
+        return False
+    lons = [p[0] for p in pts]
+    lats = [p[1] for p in pts]
+    return (max(lons) >= mn_lon and min(lons) <= mx_lon
+            and max(lats) >= mn_lat and min(lats) <= mx_lat)
+
+
+def _read_geojson_bytes(raw: bytes, source_label: str) -> list[dict]:
+    """Parse a GeoJSON byte blob into a list of features.
+
+    Accepts both top-level FeatureCollection and a bare list of features.
+    Returns [] (with a warning) on parse failure rather than raising — so a
+    single bad URL doesn't sink the whole run.
+    """
     try:
-        with open(path) as f:
-            fc = json.load(f)
-    except Exception:
-        return False
-    return (isinstance(fc, dict)
-            and fc.get("type") == "FeatureCollection"
-            and bool(fc.get("features")))
+        doc = json.loads(raw)
+    except Exception as e:
+        print(f"  WARN: {source_label} is not valid JSON ({e}); skipping.")
+        return []
+    if isinstance(doc, dict) and doc.get("type") == "FeatureCollection":
+        return doc.get("features") or []
+    if isinstance(doc, list):
+        return [f for f in doc if isinstance(f, dict) and f.get("type") == "Feature"]
+    if isinstance(doc, dict) and doc.get("type") == "Feature":
+        return [doc]
+    print(f"  WARN: {source_label} is JSON but not a FeatureCollection / Feature; "
+          f"skipping (top-level type: {doc.get('type') if isinstance(doc, dict) else type(doc).__name__}).")
+    return []
 
 
-if _force_refresh or not _cache_is_usable(flood_path):
+def _download(url: str, max_attempts: int = 3) -> bytes:
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = Request(url, headers={"User-Agent": "flood-demo/1.0"})
+            with urlopen(req, timeout=180) as r:
+                return r.read()
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Download failed for {url}: {last_err!r}") from last_err
+
+
+def _fetch_cems_features(urls: list[str], local_dir: str,
+                         year_default: str,
+                         mn_lon, mn_lat, mx_lon, mx_lat) -> list[dict]:
+    """Aggregate CEMS Rapid Mapping features from URLs and a local drop folder.
+
+    For each input file, we extract a year from (in priority order) the
+    feature properties, the source filename, the configured `year_default`,
+    or `""`. Geometries are bbox-clipped to the AOI to drop AoI overshoot.
+    """
+    sources: list[tuple[str, bytes]] = []  # (label, raw bytes)
+
+    # Remote URLs
+    for u in urls:
+        u = u.strip()
+        if not u:
+            continue
+        path = urlparse(u).path.lower()
+        if not (path.endswith(".geojson") or path.endswith(".json")):
+            print(f"  WARN: {u} doesn't look like GeoJSON (extension '{path.rsplit('.',1)[-1]}'); "
+                  f"attempting to parse anyway. For shapefile zips, download "
+                  f"the GeoJSON product from the CEMS portal instead.")
+        print(f"  fetching {u}")
+        try:
+            raw = _download(u)
+            sources.append((os.path.basename(path) or u, raw))
+        except Exception as e:
+            print(f"  WARN: failed to download {u}: {e}; skipping.")
+
+    # Local drop folder
+    if os.path.isdir(local_dir):
+        for fn in sorted(os.listdir(local_dir)):
+            if not (fn.lower().endswith(".geojson") or fn.lower().endswith(".json")):
+                continue
+            fp = os.path.join(local_dir, fn)
+            print(f"  reading local {fp}")
+            try:
+                with open(fp, "rb") as f:
+                    sources.append((fn, f.read()))
+            except Exception as e:
+                print(f"  WARN: failed to read {fp}: {e}; skipping.")
+
+    if not sources:
+        return []
+
+    out: list[dict] = []
+    kept = dropped_oob = 0
+    for label, raw in sources:
+        feats = _read_geojson_bytes(raw, label)
+        file_year = _year_from_string(label)
+        for feat in feats:
+            geom = feat.get("geometry") or {}
+            if not _bbox_hits(geom, mn_lon, mn_lat, mx_lon, mx_lat):
+                dropped_oob += 1
+                continue
+            props = feat.get("properties") or {}
+            year = (_year_from_feature_props(props) or file_year
+                    or year_default or "")
+            props["year"] = year
+            props.setdefault("cems_source", label)
+            feat["properties"] = props
+            out.append(feat)
+            kept += 1
+    print(f"  CEMS: kept {kept} features, dropped {dropped_oob} outside AOI bbox "
+          f"(across {len(sources)} sources)")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dispatch
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"flood_source = {flood_source!r}")
+
+if _force_refresh or not _cache_is_usable(flood_path, allow_empty=(flood_source == "none")):
     if _force_refresh and os.path.exists(flood_path):
         print("force_refresh_floods=true; ignoring existing cache at", flood_path)
     elif os.path.exists(flood_path):
         print("Existing flood cache is empty/malformed, re-fetching:", flood_path)
     os.makedirs(os.path.dirname(flood_path), exist_ok=True)
-    feats = _fetch_flood_features(min_lon, min_lat, max_lon, max_lat)
-    if not feats:
-        # 0 features is itself suspicious for a non-trivial AOI — surface it.
-        raise RuntimeError(
-            "MDDELCC ArcGIS returned 0 flood polygons for AOI "
-            f"({min_lon},{min_lat})->({max_lon},{max_lat}). Verify the bbox "
-            "intersects the 2017/2019 ZIS extents, or the upstream service "
-            "schema. Refusing to write an empty cache."
+
+    if flood_source == "melcc":
+        feats = _fetch_melcc_features(min_lon, min_lat, max_lon, max_lat)
+        if not feats:
+            raise RuntimeError(
+                "MDDELCC ArcGIS returned 0 flood polygons for AOI "
+                f"({min_lon},{min_lat})->({max_lon},{max_lat}). Verify the bbox "
+                "intersects the 2017/2019 ZIS extents, or switch flood_source "
+                "to 'cems' (global) or 'none' (skip). Refusing to write an empty cache."
+            )
+        years = sorted({f["properties"].get("year") or "?" for f in feats})
+        print(f"Pulled {len(feats)} MELCC flood features (years: {years}; "
+              "note: derived from decree Date_debut, not flood date)")
+
+    elif flood_source == "cems":
+        cems_local = f"{volume_root}/floods/cems_input"
+        urls = [u for u in cems_urls_raw.split(",") if u.strip()]
+        if not urls and not os.path.isdir(cems_local):
+            raise RuntimeError(
+                "flood_source='cems' but neither cems_urls nor a local drop "
+                f"directory exists. Either set --var=cems_urls=https://... or "
+                f"upload GeoJSON files to {cems_local}/. Browse "
+                "https://emergency.copernicus.eu/mapping/list-of-activations-rapid "
+                "for activation downloads."
+            )
+        feats = _fetch_cems_features(
+            urls, cems_local, cems_year_default,
+            min_lon, min_lat, max_lon, max_lat,
         )
+        if not feats:
+            raise RuntimeError(
+                "flood_source='cems' produced 0 features after AOI clipping. "
+                "Verify the activation AoI overlaps your bbox and that the URLs "
+                "point to GeoJSON (not Shapefile) products."
+            )
+        years = sorted({f["properties"].get("year") or "?" for f in feats})
+        print(f"Loaded {len(feats)} CEMS flood features (years: {years})")
+
+    elif flood_source == "none":
+        feats = []
+        print("flood_source='none' — writing an empty FeatureCollection. "
+              "The App's validation overlay will be hidden.")
+
+    else:
+        raise ValueError(
+            f"Unknown flood_source={flood_source!r}. Use 'melcc', 'cems', or 'none'."
+        )
+
     fc = {"type": "FeatureCollection", "features": feats}
-    years = sorted({f["properties"].get("year") or "?" for f in feats})
-    print(f"Pulled {len(feats)} flood features from MDDELCC ArcGIS "
-          f"(years: {years}; note: derived from decree Date_debut, not flood date)")
     with open(flood_path, "w") as f:
         json.dump(fc, f)
 else:
@@ -428,7 +664,7 @@ dem_df = spark.createDataFrame(
 )
 (dem_df.withColumn("ingested_at", F.current_timestamp())
        .write.mode("overwrite")
-       .option("overwriteSchema", "true")
+       .partitionBy("aoi_name")
        .saveAsTable(f"{bronze_ns}.bronze_dem_manifest"))
 
 # Hydrography -> bronze (one row per feature, geometry as GeoJSON string)
@@ -453,7 +689,7 @@ hydro_df = spark.createDataFrame(
 )
 (hydro_df.withColumn("ingested_at", F.current_timestamp())
         .write.mode("overwrite")
-        .option("overwriteSchema", "true")
+        .partitionBy("aoi_name")
         .saveAsTable(f"{bronze_ns}.bronze_hydrography"))
 
 # Historical flood polygons -> bronze
@@ -503,7 +739,7 @@ flood_df = spark.createDataFrame(
 
 (flood_df.withColumn("ingested_at", F.current_timestamp())
          .write.mode("overwrite")
-         .option("overwriteSchema", "true")
+         .partitionBy("aoi_name")
          .saveAsTable(f"{bronze_ns}.bronze_flood_events"))
 
 # Buildings -> bronze (point centroid + residential flag + OSM-derived tags)
@@ -531,7 +767,7 @@ bld_df = spark.createDataFrame(bld_rows, schema=bld_schema) \
     if bld_rows else spark.createDataFrame([], schema=bld_schema)
 (bld_df.withColumn("ingested_at", F.current_timestamp())
        .write.mode("overwrite")
-       .option("overwriteSchema", "true")
+       .partitionBy("aoi_name")
        .saveAsTable(f"{bronze_ns}.bronze_buildings"))
 
 # COMMAND ----------
@@ -660,7 +896,7 @@ precip_df = spark.createDataFrame(
 )
 (precip_df.withColumn("ingested_at", F.current_timestamp())
           .write.mode("overwrite")
-          .option("overwriteSchema", "true")
+          .partitionBy("aoi_name")
           .saveAsTable(f"{bronze_ns}.bronze_precip_grid"))
 
 print("Bronze tables written:")

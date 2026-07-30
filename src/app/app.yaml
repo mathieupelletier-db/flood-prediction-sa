@@ -8,9 +8,13 @@ command:
 
 env:
   - name: DATABRICKS_CATALOG
-    value: "catalog_j4zl8j_om2ldn"
+    value: "classic_stable_2cn624"
+  # Schema must match the bundle deploy. With DAB's `mode: development` and the
+  # default var.schema=montreal, the deployed schema name is prefixed to
+  # `dev_<user>_montreal`. If you override `--var=schema=<name>` at deploy time,
+  # update this to `dev_<user>_<name>` (or whatever the deploy target produces).
   - name: DATABRICKS_SCHEMA
-    value: "dev_mathieu_pelletier_mpelletier_flood_montreal_dev"
+    value: "dev_mathieu_pelletier_montreal"
   - name: DEFAULT_AOI
     value: "greater_montreal"
   - name: MAX_CELLS_PER_REQUEST
@@ -19,6 +23,12 @@ env:
   # databricks-sql-connector understands. The service principal token is
   # injected automatically by Databricks Apps via DATABRICKS_CLIENT_ID/SECRET.
   - name: DATABRICKS_HOST
-    value: "adb-7405618598462441.1.azuredatabricks.net"
+    value: "adb-7405612117836809.9.azuredatabricks.net"
   - name: DATABRICKS_HTTP_PATH
-    value: "/sql/1.0/warehouses/0334a8e49aac8b19"
+    value: "/sql/1.0/warehouses/e921c86338f3e272"
+  # Underwriter chat (Genie Space). Provisioned by scripts/genie_bootstrap.py.
+  # Databricks Apps deploys this file verbatim (no `${var.X}` substitution),
+  # so the space id is hardcoded - same pattern as DATABRICKS_HOST/HTTP_PATH
+  # above. Set to "" to hide the chat panel.
+  - name: DATABRICKS_GENIE_SPACE_ID
+    value: "01f153a756791677b216b0ad29cafef1"
