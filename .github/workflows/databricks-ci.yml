@@ -12,6 +12,13 @@ concurrency:
   group: databricks-dev
   cancel-in-progress: false
 
+env:
+  # Azure FEVM workspace currently hosting this demo (see src/app/app.yaml).
+  DATABRICKS_HOST: https://adb-7405612117836809.9.azuredatabricks.net
+  DATABRICKS_TOKEN: ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}
+  # Known serverless warehouse bound to the deployed app.
+  WAREHOUSE_ID: e921c86338f3e272
+
 jobs:
   validate-and-test:
     # Switch to `runs-on: html_publisher` once this repo is moved into the
@@ -45,6 +52,9 @@ jobs:
       - name: Build React SPA
         working-directory: src/app/client
         env:
+          # Keep Databricks credentials out of this step's environment.
+          DATABRICKS_HOST: ''
+          DATABRICKS_TOKEN: ''
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org
           NPM_CONFIG_FETCH_TIMEOUT: '120000'
           NPM_CONFIG_FETCH_RETRIES: '2'
@@ -61,81 +71,46 @@ jobs:
           fi
           npm run build
 
-      - name: Set up Databricks CLI
-        uses: databricks/setup-cli@main
-
-      - name: Get or Create serverless SQL warehouse
-        env:
-          DATABRICKS_HOST: 'https://e2-demo-field-eng.cloud.databricks.com'
-          DATABRICKS_TOKEN: ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}
+      - name: Require Databricks token
         run: |
-          WAREHOUSE_NAME="Shared Unity Catalog Serverless"
-          echo "Looking for warehouse named: $WAREHOUSE_NAME"
-
-          EXISTING_WAREHOUSE=$(curl -s -H "Authorization: Bearer $DATABRICKS_TOKEN" \
-            "$DATABRICKS_HOST/api/2.0/sql/warehouses")
-
-          WAREHOUSE_ID=$(echo "$EXISTING_WAREHOUSE" | python3 -c "
-          import sys, json, argparse
-          parser = argparse.ArgumentParser()
-          parser.add_argument('--name', required=True)
-          args = parser.parse_args()
-          try:
-              data = json.load(sys.stdin)
-              warehouses = data.get('warehouses', [])
-              matching = [w for w in warehouses if w['name'] == args.name]
-              print(matching[0]['id'] if matching else '')
-          except Exception as e:
-              print(f'Error parsing response: {e}', file=sys.stderr)
-              print('')
-          " --name "$WAREHOUSE_NAME")
-
-          if [ -z "$WAREHOUSE_ID" ]; then
-            echo "Creating new warehouse..."
-            RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $DATABRICKS_TOKEN" \
-              -H "Content-Type: application/json" \
-              "$DATABRICKS_HOST/api/2.0/sql/warehouses" \
-              -d "{
-                \"name\": \"${WAREHOUSE_NAME}\",
-                \"cluster_size\": \"2X-Small\",
-                \"enable_serverless_compute\": true,
-                \"auto_stop_mins\": 10,
-                \"max_num_clusters\": 1
-              }")
-            WAREHOUSE_ID=$(echo $RESPONSE | python3 -c "import sys, json; print(json.load(sys.stdin).get('id', ''))")
-          else
-            echo "Found existing warehouse with ID: $WAREHOUSE_ID"
-          fi
-
-          if [ -z "$WAREHOUSE_ID" ]; then
-            echo "Error: Failed to get warehouse ID"
+          if [ -z "${DATABRICKS_TOKEN}" ]; then
+            echo "::error::DEPLOY_NOTEBOOK_TOKEN secret is not set on this repository"
             exit 1
           fi
 
-          echo "Using warehouse with ID: $WAREHOUSE_ID"
-          echo "WAREHOUSE_ID=$WAREHOUSE_ID" >> $GITHUB_ENV
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@main
 
       - name: Validate bundle
-        env:
-          DATABRICKS_HOST: 'https://e2-demo-field-eng.cloud.databricks.com'
-          DATABRICKS_TOKEN: ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}
-        run: databricks bundle validate --target dev --var="warehouse_id=${WAREHOUSE_ID}"
+        run: >
+          databricks bundle validate --target dev
+          --var=warehouse_id=${WAREHOUSE_ID}
+          --var=catalog=classic_stable_2cn624
+          --var=schema=montreal
+          --var=genie_space_id=01f153a756791677b216b0ad29cafef1
 
       - name: Deploy bundle
-        env:
-          DATABRICKS_HOST: 'https://e2-demo-field-eng.cloud.databricks.com'
-          DATABRICKS_TOKEN: ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}
-        run: databricks bundle deploy --target dev --var="warehouse_id=${WAREHOUSE_ID}"
+        run: >
+          databricks bundle deploy --target dev
+          --var=warehouse_id=${WAREHOUSE_ID}
+          --var=catalog=classic_stable_2cn624
+          --var=schema=montreal
+          --var=genie_space_id=01f153a756791677b216b0ad29cafef1
 
       - name: Run flood pipeline
-        env:
-          DATABRICKS_HOST: 'https://e2-demo-field-eng.cloud.databricks.com'
-          DATABRICKS_TOKEN: ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}
-        run: databricks bundle run flood_pipeline --target dev --var="warehouse_id=${WAREHOUSE_ID}"
+        run: >
+          databricks bundle run flood_pipeline --target dev
+          --var=warehouse_id=${WAREHOUSE_ID}
+          --var=catalog=classic_stable_2cn624
+          --var=schema=montreal
+          --var=genie_space_id=01f153a756791677b216b0ad29cafef1
 
       - name: Cleanup PR deployment
         if: success() && github.event_name == 'pull_request'
-        env:
-          DATABRICKS_HOST: 'https://e2-demo-field-eng.cloud.databricks.com'
-          DATABRICKS_TOKEN: ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}
-        run: databricks bundle destroy --target dev --auto-approve --var="warehouse_id=${WAREHOUSE_ID}" || true
+        run: >
+          databricks bundle destroy --target dev --auto-approve
+          --var=warehouse_id=${WAREHOUSE_ID}
+          --var=catalog=classic_stable_2cn624
+          --var=schema=montreal
+          --var=genie_space_id=01f153a756791677b216b0ad29cafef1
+          || true
