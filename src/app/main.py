@@ -603,7 +603,7 @@ def buildings_at_risk(
 NOMINATIM_URL = os.environ.get("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
 NOMINATIM_USER_AGENT = os.environ.get(
     "NOMINATIM_USER_AGENT",
-    "flood-prediction-demo/0.1 (github.com/mathieupelletier-db/flood-prediction-sa)",
+    "flood-prediction-demo/0.1 (github.com/databricks-industry-solutions/flood-prediction)",
 )
 
 

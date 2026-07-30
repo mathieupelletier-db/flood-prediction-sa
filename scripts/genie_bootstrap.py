@@ -9,10 +9,10 @@ workspace it is updated in place, otherwise a new one is created.
 
 Usage:
     python scripts/genie_bootstrap.py \
-        --profile        adb-7405612117836809 \
-        --catalog        classic_stable_2cn624 \
-        --schema         dev_mathieu_pelletier_montreal \
-        --warehouse-id   e921c86338f3e272
+        --profile        <databricks-cli-profile> \
+        --catalog        flood_demo \
+        --schema         montreal \
+        --warehouse-id   <sql-warehouse-id>
 
 Prints the resulting `space_id` to stdout so it can be fed straight back into
 the DABs deploy as `--var=genie_space_id=...`:

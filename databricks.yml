@@ -1,5 +1,5 @@
 bundle:
-  name: flood-prediction-sa
+  name: flood-prediction
 
 include:
   - resources/*.yml

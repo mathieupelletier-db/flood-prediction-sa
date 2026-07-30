@@ -338,10 +338,10 @@ out-of-band with a one-line script:
 
 ```bash
 GENIE_SPACE_ID=$(python scripts/genie_bootstrap.py \
-    --profile      adb-7405612117836809 \
-    --catalog      classic_stable_2cn624 \
-    --schema       dev_mathieu_pelletier_montreal \
-    --warehouse-id e921c86338f3e272 \
+    --profile      <databricks-cli-profile> \
+    --catalog      flood_demo \
+    --schema       montreal \
+    --warehouse-id <sql-warehouse-id> \
     --grant-sp     <app-service-principal-application-id>)
 
 databricks bundle deploy -t dev --var=genie_space_id=$GENIE_SPACE_ID

@@ -168,7 +168,7 @@ What would make this production-grade:
 
 ## Try it yourself
 
-The full source is at [github.com/mathieupelletier-db/flood-prediction-sa](https://github.com/mathieupelletier-db/flood-prediction-sa). To deploy:
+The full source is at [github.com/databricks-industry-solutions/flood-prediction](https://github.com/databricks-industry-solutions/flood-prediction). To deploy:
 
 ```bash
 # Build the React SPA
