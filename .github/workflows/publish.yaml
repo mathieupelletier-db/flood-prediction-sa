@@ -2,7 +2,7 @@ name: publish
 
 on:
   push:
-    branches: [ main, preview ]
+    branches: [ main, preview, blueprint ]
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,7 @@ jobs:
     # available. Until then, use the public ubuntu runner.
     runs-on: ubuntu-latest
     environment:
-      name: ${{ github.ref_name == 'main' && 'github-pages' || 'preview' }}
+      name: ${{ github.ref_name == 'preview' && 'preview' || 'github-pages' }}
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
 
